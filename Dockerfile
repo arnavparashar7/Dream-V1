@@ -1,83 +1,53 @@
-# Stage 1: Base image with common dependencies
-FROM nvidia/cuda:12.6.3-cudnn-runtime-ubuntu24.04 AS base
+# Stage 0: Base image definition
+FROM python:3.10-CUDA12.1 AS base
 
-# Prevents prompts from packages asking for user input during installation
+# Prevent Python from writing .pyc files
+ENV PYTHONDONTWRITEBYTECODE=1
+
+# Set environment for non-interactive apt-get
 ENV DEBIAN_FRONTEND=noninteractive
-# Prefer binary wheels over source distributions for faster pip installations
-ENV PIP_PREFER_BINARY=1
-# Ensures output from python is printed immediately to the terminal without buffering
-ENV PYTHONUNBUFFERED=1
-# Speed up some cmake builds
-ENV CMAKE_BUILD_PARALLEL_LEVEL=8
 
-# Install Python, git and other necessary tools
-RUN apt-get update && apt-get install -y \
-    python3.12 \
-    python3.12-venv \
-    git \
-    wget \
-    libgl1 \
-    libglib2.0-0 \
-    libsm6 \
-    libxext6 \
-    libxrender1 \
-    ffmpeg \
-    && ln -sf /usr/bin/python3.12 /usr/bin/python \
-    && ln -sf /usr/bin/pip3 /usr/bin/pip
+# Install common dependencies
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        wget \
+        git \
+        libgl1 \
+        libglib2.0-0 \
+        python3-opencv && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
 
-# Clean up to reduce image size
-RUN apt-get autoremove -y && apt-get clean -y && rm -rf /var/lib/apt/lists/*
+# Stage 1: Install ComfyUI and its core dependencies
+FROM base AS installer
 
-# Install uv (latest) using official installer and create isolated venv
-RUN wget -qO- https://astral.sh/uv/install.sh | sh \
-    && ln -s /root/.local/bin/uv /usr/local/bin/uv \
-    && ln -s /root/.local/bin/uvx /usr/local/bin/uvx \
-    && uv venv /opt/venv
+# Set Python build options for uv
+ENV UV_SYSTEM_PYTHON=1
+ENV UV_PYTHON_INSTALL_NATIVE_LIBS=1
 
-# Use the virtual environment for all subsequent commands
-ENV PATH="/opt/venv/bin:${PATH}"
-
-# Install comfy-cli + dependencies needed by it to install ComfyUI
-RUN uv pip install comfy-cli pip setuptools wheel
-
-# Install ComfyUI
-RUN /usr/bin/yes | comfy --workspace /comfyui install --version 0.3.43 --cuda-version 12.6 --nvidia
-
-# Change working directory to ComfyUI
+# Change to /comfyui directory for installation
 WORKDIR /comfyui
 
-# Support for the network volume
-ADD src/extra_model_paths.yaml ./
+# Clone ComfyUI
+RUN git clone https://github.com/comfyanonymous/ComfyUI.git .
 
-# Go back to the root
-WORKDIR /
+# Install uv for fast dependency management
+RUN pip install uv
 
-# Install Python runtime dependencies for the handler
-RUN uv pip install runpod requests websocket-client
-
-# Add application code and scripts
-ADD src/start.sh handler.py test_input.json ./
-RUN chmod +x /start.sh
-
-# Add script to install custom nodes
-COPY scripts/comfy-node-install.sh /usr/local/bin/comfy-node-install
-RUN chmod +x /usr/local/bin/comfy-node-install
-
-# Prevent pip from asking for confirmation during uninstall steps in custom nodes
-ENV PIP_NO_INPUT=1
-
-# Copy helper script to switch Manager network mode at container start
-COPY scripts/comfy-manager-set-mode.sh /usr/local/bin/comfy-manager-set-mode
-RUN chmod +x /usr/local/bin/comfy-manager-set-mode
-
-# Set the default command to run when starting the container
-CMD ["/start.sh"]
+# Install ComfyUI dependencies
+# Exclude torch, torchvision, torchaudio as they are part of the base CUDA image
+# Or use the specific commands for CUDA from ComfyUI
+RUN uv pip install --system --no-deps -r requirements.txt && \
+    uv pip install --system \
+        xformers \
+        opencv-python \
+        -r requirements.txt --index-url https://download.pytorch.org/whl/cu121
 
 # Stage 2: Download models
 FROM base AS downloader
 
 ARG HUGGINGFACE_ACCESS_TOKEN
-# Set default model type if none is provided.
+# Set default model type if none is provided
 ARG MODEL_TYPE=flux1-dev-fp8
 
 # Change working directory to ComfyUI
@@ -87,6 +57,7 @@ WORKDIR /comfyui
 RUN mkdir -p models/checkpoints models/vae models/unet models/clip models/controlnet models/text_encoders
 
 # Download checkpoints/vae/unet/clip models to include in image based on model type
+# All paths here are relative to WORKDIR /comfyui
 # --- Model Downloads ---
 # CLIP Text Encoders
 RUN wget -O /comfyui/models/text_encoders/clip_l.safetensors https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/clip_l.safetensors
@@ -100,9 +71,6 @@ RUN wget -O /comfyui/models/vae/ae.safetensors https://huggingface.co/Comfy-Org/
 
 # Flux ControlNet Model
 RUN wget -O /comfyui/models/controlnet/flux-depth-controlnet-v3.safetensors https://huggingface.co/XLabs-AI/flux-controlnet-depth-v3/resolve/main/flux-depth-controlnet-v3.safetensors
-
-# Add any other models if necessary, ensure they go into the correct ComfyUI model sub-folder.
-# Example: RUN wget -O /comfyui/models/loras/my_lora.safetensors https://example.com/my_lora.safetensors
 
 # Stage 3: Final image
 FROM base AS final
@@ -127,33 +95,27 @@ COPY workflows/ /workspace/worker/workflows/
 COPY scripts/ /workspace/worker/scripts/
 COPY .rp_ignore /workspace/worker/.rp_ignore
 
-# --- System-level installations and setup for final image ---
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-        git \
-        wget \
-        libgl1 \
-        libglib2.0-0 && \
-    apt-get clean && \
-    rm -rf /var/lib/apt/lists/*
-
-# Fix any broken dependencies (sometimes needed after initial installs)
-RUN apt-get update && apt-get install -f -y && apt-get clean && rm -rf /var/lib/apt/lists/*
-
-# Ensure `git` is in the PATH (if not already)
-ENV PATH="/usr/bin/git:$PATH"
-
 # --- Custom Nodes Installation ---
 # Note: Use --depth 1 for shallow clones to save space and time
+# These custom nodes will be installed directly into the ComfyUI folder from the installer stage.
+WORKDIR /comfyui
+
 # This one contains core Flux nodes like DualCLIPLoader, DifferentialDiffusion etc.
-RUN git clone --depth 1 https://github.com/Comfy-Org/ComfyUI-Flux-Nodes.git /comfyui/custom_nodes/ComfyUI-Flux-Nodes && \
-    pip install -r /comfyui/custom_nodes/ComfyUI-Flux-Nodes/requirements.txt
+RUN git clone --depth 1 https://github.com/Comfy-Org/ComfyUI-Flux-Nodes.git custom_nodes/ComfyUI-Flux-Nodes && \
+    pip install -r custom_nodes/ComfyUI-Flux-Nodes/requirements.txt
 
 # This one is also useful for some Xlabs specific Flux nodes
-RUN git clone --depth 1 https://github.com/XLabs-AI/x-flux-comfyui.git /comfyui/custom_nodes/XLabs-AI
+RUN git clone --depth 1 https://github.com/XLabs-AI/x-flux-comfyui.git custom_nodes/XLabs-AI
 
 # For ColorMatch (from comfyui-kjnodes)
-RUN git clone --depth 1 https://github.com/kijai/ComfyUI-KJNodes.git /comfyui/custom_nodes/comfyui-kjnodes && \
-    pip install -r /comfyui/custom_nodes/comfyui-kjnodes/requirements.txt
+RUN git clone --depth 1 https://github.com/kijai/ComfyUI-KJNodes.git custom_nodes/comfyui-kjnodes && \
+    pip install -r custom_nodes/comfyui-kjnodes/requirements.txt
 
-RUN pip install requests
+WORKDIR /workspace/worker
+
+# Expose ports for ComfyUI and the RunPod worker
+EXPOSE 8080 5000
+
+# Set entrypoint for the worker
+ENTRYPOINT ["python3", "-u", "/workspace/worker/src/handler.py"]
+CMD ["--rp_args"] # For RunPod Serverless, you can pass arguments here if needed
