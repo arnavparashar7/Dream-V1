@@ -40,16 +40,17 @@ WORKDIR /comfyui
 RUN git clone https://github.com/comfyanonymous/ComfyUI.git .
 
 # Install uv for fast dependency management
-RUN pip install uv
+RUN python3 -m pip install uv
 
-# Install ComfyUI dependencies
-# Exclude torch, torchvision, torchaudio as they are part of the base CUDA image
-# Or use the specific commands for CUDA from ComfyUI
-RUN uv pip install --system --no-deps -r requirements.txt && \
-    uv pip install --system \
-        xformers \
-        opencv-python \
-        -r requirements.txt --index-url https://download.pytorch.org/whl/cu121
+# Install ComfyUI dependencies including torch, torchvision, torchaudio, xformers, opencv-python
+# Use the official PyTorch wheel URL for CUDA 12.1
+# Force a specific xformers version known to be compatible with PyTorch 2.1.0 and CUDA 12.1
+# Note: uv will intelligently handle dependencies and resolve versions.
+RUN uv pip install --system \
+    -r requirements.txt \
+    xformers==0.0.22.post7 \
+    --index-url https://download.pytorch.org/whl/cu121 \
+    --extra-index-url https://pypi.org/simple/ # Add PyPI as an extra source for other packages
 
 # Stage 2: Download models
 FROM base AS downloader
