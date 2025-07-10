@@ -109,10 +109,6 @@ COPY .rp_ignore /workspace/worker/.rp_ignore
 # These custom nodes will be installed directly into the ComfyUI folder from the installer stage.
 WORKDIR /comfyui
 
-# This one contains core Flux nodes like DualCLIPLoader, DifferentialDiffusion etc.
-RUN git clone --depth 1 https://github.com/Comfy-Org/ComfyUI-Flux-Nodes.git custom_nodes/ComfyUI-Flux-Nodes && \
-    pip install -r custom_nodes/ComfyUI-Flux-Nodes/requirements.txt
-
 # This one is also useful for some Xlabs specific Flux nodes
 RUN git clone --depth 1 https://github.com/XLabs-AI/x-flux-comfyui.git custom_nodes/XLabs-AI
 
