@@ -105,31 +105,55 @@ RUN wget -O /comfyui/models/controlnet/flux-depth-controlnet-v3.safetensors http
 # Example: RUN wget -O /comfyui/models/loras/my_lora.safetensors https://example.com/my_lora.safetensors
 
 # Stage 3: Final image
-# ... (rest of the Dockerfile remains unchanged from the last corrected version)
-# Stage 3: Final image
 FROM base AS final
 
-# Copy models from stage 2 to the final image
-COPY --from=downloader /comfyui/models /comfyui/models
+# Set ENV variables for the running container (not during build)
+ENV PYTHONUNBUFFERED=1 \
+    COMFYUI_PATH=/comfyui \
+    COMFYUI_MODELS_PATH=/comfyui/models \
+    RUNPOD_DEBUG_PORT=5000 \
+    UVICORN_PORT=8080 \
+    CUDA_VISIBLE_DEVICES=0 \
+    PATH="/usr/bin/python3:$PATH" \
+    PYTHONPATH=$PYTHONPATH:/comfyui/custom_nodes/AITemplate/python
 
-# Copy workflows
+WORKDIR /workspace/worker
+
+# Copy source code and models from previous stages
+COPY --from=installer /comfyui /comfyui
+COPY --from=downloader /comfyui/models /comfyui/models
+COPY src/ /workspace/worker/src/
 COPY workflows/ /workspace/worker/workflows/
+COPY scripts/ /workspace/worker/scripts/
+COPY .rp_ignore /workspace/worker/.rp_ignore
+
+# --- System-level installations and setup for final image ---
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        git \
+        wget \
+        libgl1 \
+        libglib2.0-0 && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+# Fix any broken dependencies (sometimes needed after initial installs)
+RUN apt-get update && apt-get install -f -y && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Ensure `git` is in the PATH (if not already)
+ENV PATH="/usr/bin/git:$PATH"
 
 # --- Custom Nodes Installation ---
-# Ensure correct repos for Flux/Kontext nodes
+# Note: Use --depth 1 for shallow clones to save space and time
 # This one contains core Flux nodes like DualCLIPLoader, DifferentialDiffusion etc.
-RUN git clone https://github.com/Comfy-Org/ComfyUI-Flux-Nodes.git custom_nodes/ComfyUI-Flux-Nodes && \
-    pip install -r custom_nodes/ComfyUI-Flux-Nodes/requirements.txt
+RUN git clone --depth 1 https://github.com/Comfy-Org/ComfyUI-Flux-Nodes.git /comfyui/custom_nodes/ComfyUI-Flux-Nodes && \
+    pip install -r /comfyui/custom_nodes/ComfyUI-Flux-Nodes/requirements.txt
 
 # This one is also useful for some Xlabs specific Flux nodes
-RUN git clone https://github.com/XLabs-AI/x-flux-comfyui.git custom_nodes/XLabs-AI
+RUN git clone --depth 1 https://github.com/XLabs-AI/x-flux-comfyui.git /comfyui/custom_nodes/XLabs-AI
 
 # For ColorMatch (from comfyui-kjnodes)
-RUN git clone https://github.com/kijai/ComfyUI-KJNodes.git custom_nodes/comfyui-kjnodes && \
-    pip install -r custom_nodes/comfyui-kjnodes/requirements.txt
-
-# Add any other custom nodes you might have, using the same pattern:
-# RUN git clone <your_custom_node_repo_url> custom_nodes/<your_custom_node_folder_name> && \
-#     pip install -r custom_nodes/<your_custom_node_folder_name>/requirements.txt
+RUN git clone --depth 1 https://github.com/kijai/ComfyUI-KJNodes.git /comfyui/custom_nodes/comfyui-kjnodes && \
+    pip install -r /comfyui/custom_nodes/comfyui-kjnodes/requirements.txt
 
 RUN pip install requests
