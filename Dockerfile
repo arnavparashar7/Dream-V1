@@ -45,9 +45,9 @@ RUN python3 -m pip install uv
 # - Specific xformers version (crucial for performance with PyTorch)
 # - Specify PyTorch CUDA 12.1 wheel URL and general PyPI for other packages
 RUN uv pip install --system \
-    -r requirements.txt \              `# ComfyUI's original requirements.txt (in /comfyui)`
-    -r /tmp/user_requirements.txt \    `# Your custom requirements.txt (copied from repo root)`
-    xformers==0.0.22.post7 \           `# Explicit xformers version`
+    -r requirements.txt \
+    -r /tmp/user_requirements.txt \
+    xformers==0.0.22.post7 \
     --index-url https://download.pytorch.org/whl/cu121 \
     --extra-index-url https://pypi.org/simple/
 
