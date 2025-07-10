@@ -1,5 +1,5 @@
 # Stage 0: Base image definition
-FROM python:3.10-CUDA12.1 AS base
+FROM nvidia/cuda:12.1.1-devel-ubuntu22.04 AS base
 
 # Prevent Python from writing .pyc files
 ENV PYTHONDONTWRITEBYTECODE=1
@@ -7,16 +7,24 @@ ENV PYTHONDONTWRITEBYTECODE=1
 # Set environment for non-interactive apt-get
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Install common dependencies
+# Install Python 3.10, pip, and other common dependencies
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
+        python3.10 \
+        python3.10-distutils \
+        python3-pip \
         wget \
         git \
         libgl1 \
         libglib2.0-0 \
         python3-opencv && \
+    # Set python3.10 as the default python3
+    update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1 && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
+
+# Upgrade pip and setuptools for the newly installed python3.10
+RUN python3 -m pip install --upgrade pip setuptools
 
 # Stage 1: Install ComfyUI and its core dependencies
 FROM base AS installer
