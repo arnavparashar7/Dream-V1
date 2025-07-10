@@ -2,6 +2,7 @@
 runpod~=1.7.12
 websocket-client
 requests
+runpod
 # other existing packages from your requirements.txt
 torch==2.1.0 # (example, if you explicitly keep it)
 torchvision==0.16.0
