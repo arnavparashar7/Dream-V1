@@ -84,26 +84,28 @@ ARG MODEL_TYPE=flux1-dev-fp8
 WORKDIR /comfyui
 
 # Create necessary directories upfront
-RUN mkdir -p models/checkpoints models/vae models/unet models/clip
+RUN mkdir -p models/checkpoints models/vae models/unet models/clip models/controlnet models/text_encoders
 
 # Download checkpoints/vae/unet/clip models to include in image based on model type
 # --- Model Downloads ---
 # CLIP Text Encoders
-RUN wget -O /workspace/ComfyUI/models/text_encoders/clip_l.safetensors https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/clip_l.safetensors
-RUN wget -O /workspace/ComfyUI/models/text_encoders/t5xxl_fp8_e4m3fn_scaled.safetensors https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/t5xxl_fp8_e4m3fn_scaled.safetensors
+RUN wget -O /comfyui/models/text_encoders/clip_l.safetensors https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/clip_l.safetensors
+RUN wget -O /comfyui/models/text_encoders/t5xxl_fp8_e4m3fn_scaled.safetensors https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/t5xxl_fp8_e4m3fn_scaled.safetensors
 
 # UNET/Diffusion Model
-RUN wget -O /workspace/ComfyUI/models/checkpoints/flux1-dev-kontext_fp8_scaled.safetensors https://huggingface.co/Comfy-Org/flux1-kontext-dev_ComfyUI/resolve/main/split_files/diffusion_models/flux1-dev-kontext_fp8_scaled.safetensors
+RUN wget -O /comfyui/models/checkpoints/flux1-dev-kontext_fp8_scaled.safetensors https://huggingface.co/Comfy-Org/flux1-kontext-dev_ComfyUI/resolve/main/split_files/diffusion_models/flux1-dev-kontext_fp8_scaled.safetensors
 
 # VAE
-RUN wget -O /workspace/ComfyUI/models/vae/ae.safetensors https://huggingface.co/Comfy-Org/Lumina_Image_2.0_Repackaged/resolve/main/split_files/vae/ae.safetensors
+RUN wget -O /comfyui/models/vae/ae.safetensors https://huggingface.co/Comfy-Org/Lumina_Image_2.0_Repackaged/resolve/main/split_files/vae/ae.safetensors
 
 # Flux ControlNet Model
-RUN wget -O /workspace/ComfyUI/models/controlnet/flux-depth-controlnet-v3.safetensors https://huggingface.co/Comfy-Org/flux1-kontext-dev_ComfyUI/resolve/main/split_files/controlnet/flux-depth-controlnet-v3.safetensors
+RUN wget -O /comfyui/models/controlnet/flux-depth-controlnet-v3.safetensors https://huggingface.co/Comfy-Org/flux1-kontext-dev_ComfyUI/resolve/main/split_files/controlnet/flux-depth-controlnet-v3.safetensors
 
 # Add any other models if necessary, ensure they go into the correct ComfyUI model sub-folder.
-# Example: RUN wget -O /workspace/ComfyUI/models/loras/my_lora.safetensors https://example.com/my_lora.safetensors
+# Example: RUN wget -O /comfyui/models/loras/my_lora.safetensors https://example.com/my_lora.safetensors
 
+# Stage 3: Final image
+# ... (rest of the Dockerfile remains unchanged from the last corrected version)
 # Stage 3: Final image
 FROM base AS final
 
