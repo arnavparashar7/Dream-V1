@@ -2,3 +2,9 @@
 runpod~=1.7.12
 websocket-client
 requests
+# other existing packages from your requirements.txt
+torch==2.1.0 # (example, if you explicitly keep it)
+torchvision==0.16.0
+torchaudio==2.1.0
+xformers==0.0.22.post7
+opencv-python
