@@ -33,6 +33,11 @@ FROM base AS installer
 ENV UV_SYSTEM_PYTHON=1
 ENV UV_PYTHON_INSTALL_NATIVE_LIBS=1
 
+# --- NEW STEP: Copy the user's custom requirements.txt ---
+# Copy the custom requirements.txt from the build context (repo root)
+# to a known, distinct location inside the image (e.g., /tmp/user_requirements.txt)
+COPY requirements.txt /tmp/user_requirements.txt
+
 # Change to /comfyui directory for installation
 WORKDIR /comfyui
 
@@ -42,15 +47,14 @@ RUN git clone https://github.com/comfyanonymous/ComfyUI.git .
 # Install uv for fast dependency management
 RUN python3 -m pip install uv
 
-# Install ComfyUI dependencies including torch, torchvision, torchaudio, xformers, opencv-python
-# Use the official PyTorch wheel URL for CUDA 12.1
-# Force a specific xformers version known to be compatible with PyTorch 2.1.0 and CUDA 12.1
-# Note: uv will intelligently handle dependencies and resolve versions.
+# Install ALL dependencies: ComfyUI's original requirements, user's custom requirements (including runpod),
+# and the specific xformers version. uv will handle combining and resolving dependencies.
 RUN uv pip install --system \
-    -r requirements.txt \
-    xformers==0.0.22.post7 \
+    -r requirements.txt \              `# This refers to ComfyUI's own requirements.txt in /comfyui`
+    -r /tmp/user_requirements.txt \    `# This refers to YOUR custom requirements.txt with runpod`
+    xformers==0.0.22.post7 \           `# Explicit xformers version`
     --index-url https://download.pytorch.org/whl/cu121 \
-    --extra-index-url https://pypi.org/simple/ # Add PyPI as an extra source for other packages
+    --extra-index-url https://pypi.org/simple/ # General PyPI for other packages
 
 # Stage 2: Download models
 FROM base AS downloader
