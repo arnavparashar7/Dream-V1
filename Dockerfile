@@ -116,11 +116,13 @@ COPY --from=downloader /comfyui/models /comfyui/models
 COPY workflows/ /workspace/worker/workflows/
 
 # --- Custom Nodes Installation ---
-# Install Flux and Kontext nodes (these might already be covered by RunPod's base image, but good to ensure)
-RUN git clone https://github.com/XLabs-AI/x-flux-comfyui.git custom_nodes/XLabs-AI # Contains some base Flux nodes
-# For FluxGuidance, ReferenceLatent, DualCLIPLoader, DifferentialDiffusion, FluxKontextImageScale, CLIPTextEncodeFlux
-RUN git clone git clone https://github.com/Light-x02/ComfyUI-FluxSettingsNode.git custom_nodes/ComfyUI-Flux-Nodes && \
+# Ensure correct repos for Flux/Kontext nodes
+# This one contains core Flux nodes like DualCLIPLoader, DifferentialDiffusion etc.
+RUN git clone https://github.com/Comfy-Org/ComfyUI-Flux-Nodes.git custom_nodes/ComfyUI-Flux-Nodes && \
     pip install -r custom_nodes/ComfyUI-Flux-Nodes/requirements.txt
+
+# This one is also useful for some Xlabs specific Flux nodes
+RUN git clone https://github.com/XLabs-AI/x-flux-comfyui.git custom_nodes/XLabs-AI
 
 # For ColorMatch (from comfyui-kjnodes)
 RUN git clone https://github.com/kijai/ComfyUI-KJNodes.git custom_nodes/comfyui-kjnodes && \
