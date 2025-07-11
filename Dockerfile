@@ -1,87 +1,157 @@
-# Use a NVIDIA CUDA base image for GPU support
-FROM nvcr.io/nvidia/cuda:12.1.1-devel-ubuntu22.04 AS base
+# Stage 1: Base image with common system dependencies and global Python setup
+FROM nvidia/cuda:12.6.3-cudnn-runtime-ubuntu24.04 AS base
 
-# Install necessary system packages for Python, Git, and others
+# Prevents prompts from packages asking for user input during installation
+ENV DEBIAN_FRONTEND=noninteractive
+# Prefer binary wheels over source distributions for faster pip installations
+ENV PIP_PREFER_BINARY=1
+# Ensures output from python is printed immediately to the terminal without buffering
+ENV PYTHONUNBUFFERED=1
+# Speed up some cmake builds
+ENV CMAKE_BUILD_PARALLEL_LEVEL=8
+
+# Install Python, git and other necessary tools
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3.10 \
-    python3.10-distutils \
-    python3.10-venv \
-    python3-pip \
+    python3.12 \
+    python3.12-venv \
     git \
     wget \
     curl \
     unzip \
     libgl1 \
     libglib2.0-0 \
-    && rm -rf /var/lib/apt/lists/*
+    libsm6 \
+    libxext6 \
+    libxrender1 \
+    ffmpeg \
+    && rm -rf /var/lib/apt/lists/* \
+    && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1 \
+    && update-alternatives --install /usr/bin/pip3 pip3 /usr/bin/pip3 1 \
+    && ln -sf /usr/bin/python3 /usr/bin/python \
+    && ln -sf /usr/bin/pip3 /usr/bin/pip
 
-# Link python3 to python3.10 for consistency
-RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1
-
-# Stage 1: Installer - Set up ComfyUI and install all dependencies
+# --- Installer Stage: Installs ComfyUI, uv, virtual environment, and all Python dependencies ---
 FROM base AS installer
 
-# Set Python build options for uv to install into the system Python
-ENV UV_SYSTEM_PYTHON=1
-ENV UV_PYTHON_INSTALL_NATIVE_LIBS=1
+# Install uv (latest) using official installer and create isolated venv
+# uv is installed globally first, then used to create and populate the venv
+RUN wget -qO- https://astral.sh/uv/install.sh | sh \
+    && ln -s /root/.local/bin/uv /usr/local/bin/uv \
+    && ln -s /root/.local/bin/uvx /usr/local/bin/uvx \
+    && uv venv /opt/venv
 
-# Copy the custom requirements.txt from the build context (repo root)
-# to a known, distinct location inside the image (e.g., /tmp/user_requirements.txt)
-# This ensures YOUR requirements.txt (with 'runpod') is available
-COPY requirements.txt /tmp/user_requirements.txt
+# Use the virtual environment for all subsequent commands in this stage
+ENV PATH="/opt/venv/bin:${PATH}"
 
-# Change to /comfyui directory for ComfyUI installation
+# Install comfy-cli + dependencies needed by it to install ComfyUI into the venv
+RUN uv pip install comfy-cli pip setuptools wheel
+
+# Change working directory for ComfyUI installation
 WORKDIR /comfyui
 
-# Clone ComfyUI repository
-RUN git clone https://github.com/comfyanonymous/ComfyUI.git .
+# Install ComfyUI into this workspace using comfy-cli
+# The `--workspace /comfyui` makes comfy-cli install ComfyUI here.
+# The `uv venv /opt/venv` and `ENV PATH` ensure comfy-cli operates within the venv.
+RUN /usr/bin/yes | comfy --workspace /comfyui install --version 0.3.43 --cuda-version 12.6 --nvidia
 
-# Install uv for fast dependency management and package installation
-RUN python3 -m pip install uv
+# Support for the network volume - ensure this path is correct relative to the build context
+# Assuming src/extra_model_paths.yaml is in the build context root's src/ directory
+ADD src/extra_model_paths.yaml ./
 
-# Install ALL Python dependencies:
-# - ComfyUI's original requirements.txt
-# - Your custom requirements.txt (which includes 'runpod', 'websocket-client', 'requests')
-# - Specific xformers version (crucial for performance with PyTorch)
-# - Specify PyTorch CUDA 12.1 wheel URL and general PyPI for other packages
-RUN uv pip install --system \
-    -r requirements.txt \
-    -r /tmp/user_requirements.txt \
-    xformers==0.0.22.post7 \
-    --index-url https://download.pytorch.org/whl/cu121 \
-    --extra-index-url https://pypi.org/simple/
+# Install Python runtime dependencies for the handler into the venv
+# These are the user's custom requirements that handler.py explicitly uses
+RUN uv pip install runpod requests websocket-client
 
 # --- Custom Nodes Installation ---
-# These custom nodes will be installed directly into the ComfyUI folder from this installer stage.
+# Install custom nodes and their requirements directly into the ComfyUI installation.
+# These will use the /opt/venv Python due to ENV PATH.
 
-# XLabs-AI/x-flux-comfyui contains core Flux nodes like DualCLIPLoader, DifferentialDiffusion, FluxGuidance, FluxControlNet etc.
-RUN git clone --depth 1 https://github.com/XLabs-AI/x-flux-comfyui.git custom_nodes/XLabs-AI && \
-    pip install -r custom_nodes/XLabs-AI/requirements.txt # Ensure requirements for x-flux-comfyui are installed
+# ComfyUI-Flux-Nodes contains core Flux nodes
+RUN git clone https://github.com/Comfy-Org/ComfyUI-Flux-Nodes.git custom_nodes/ComfyUI-Flux-Nodes && \
+    if [ -f custom_nodes/ComfyUI-Flux-Nodes/requirements.txt ]; then \
+        uv pip install -r custom_nodes/ComfyUI-Flux-Nodes/requirements.txt; \
+    fi
+
+# XLabs-AI/x-flux-comfyui also useful for some Xlabs specific Flux nodes
+RUN git clone https://github.com/XLabs-AI/x-flux-comfyui.git custom_nodes/XLabs-AI && \
+    if [ -f custom_nodes/XLabs-AI/requirements.txt ]; then \
+        uv pip install -r custom_nodes/XLabs-AI/requirements.txt; \
+    fi
 
 # For ColorMatch (from comfyui-kjnodes)
-RUN git clone --depth 1 https://github.com/kijai/ComfyUI-KJNodes.git custom_nodes/comfyui-kjnodes && \
-    pip install -r custom_nodes/comfyui-kjnodes/requirements.txt
+RUN git clone https://github.com/kijai/ComfyUI-KJNodes.git custom_nodes/comfyui-kjnodes && \
+    if [ -f custom_nodes/comfyui-kjnodes/requirements.txt ]; then \
+        uv pip install -r custom_nodes/comfyui-kjnodes/requirements.txt; \
+    fi
 
-# Stage 2: Final image - Copy only necessary files from installer stage
-FROM base
+# --- Downloader Stage: Downloads models to a specific location ---
+# Start from installer to get uv and comfy-cli environment for downloading
+FROM installer AS downloader
 
-# Set the working directory for the worker
+ARG HUGGINGFACE_ACCESS_TOKEN
+ARG MODEL_TYPE=flux1-dev-fp8
+
+# Change working directory to ComfyUI for model downloads
+WORKDIR /comfyui
+
+# Create necessary directories upfront
+RUN mkdir -p models/checkpoints models/vae models/unet models/clip models/controlnet models/text_encoders
+
+# Download models using wget. Ensure correct paths for downloaded files.
+# CLIP Text Encoders
+RUN wget -O models/text_encoders/clip_l.safetensors https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/clip_l.safetensors
+RUN wget -O models/text_encoders/t5xxl_fp8_e4m3fn_scaled.safetensors https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/t5xxl_fp8_e4m3fn_scaled.safetensors
+
+# UNET/Diffusion Model
+RUN wget -O models/checkpoints/flux1-dev-kontext_fp8_scaled.safetensors https://huggingface.co/Comfy-Org/flux1-kontext-dev_ComfyUI/resolve/main/split_files/diffusion_models/flux1-dev-kontext_fp8_scaled.safetensors
+
+# VAE
+RUN wget -O models/vae/ae.safetensors https://huggingface.co/Comfy-Org/Lumina_Image_2.0_Repackaged/resolve/main/split_files/vae/ae.safetensors
+
+# Flux ControlNet Model
+RUN wget -O models/controlnet/flux-depth-controlnet-v3.safetensors https://huggingface.co/Comfy-Org/flux1-kontext-dev_ComfyUI/resolve/main/split_files/controlnet/flux-depth-controlnet-v3.safetensors
+
+# --- Final Image Stage: Combines all necessary components for runtime ---
+FROM base AS final
+
+# Set the virtual environment path for runtime
+ENV PATH="/opt/venv/bin:${PATH}"
+
+# Copy the virtual environment from the installer stage
+# This copies all installed Python packages (ComfyUI, runpod, custom node deps)
+COPY --from=installer /opt/venv /opt/venv
+
+# Copy the ComfyUI installation itself from the installer stage
+COPY --from=installer /comfyui /comfyui
+
+# Copy models from the downloader stage
+COPY --from=downloader /comfyui/models /comfyui/models
+
+# Set the working directory for the worker's application code
 WORKDIR /workspace/worker
 
-# Create the src directory inside the worker directory for handler.py
+# Create the src directory inside the worker directory
 RUN mkdir -p /workspace/worker/src
 
-# Copy handler.py and other worker files from the build context (assuming they are in src/)
-COPY src/ /workspace/worker/src/
+# Add application code and scripts
+# Assuming handler.py is in src/, and start.sh is in src/
+# COPY src/start.sh /workspace/worker/start.sh
+# COPY src/handler.py /workspace/worker/src/handler.py
+# COPY src/test_input.json /workspace/worker/src/test_input.json # if needed
+# Use ADD for convenience if start.sh/test_input.json are directly in src/
+ADD src/start.sh /workspace/worker/start.sh
+ADD src/handler.py /workspace/worker/src/handler.py
+ADD src/test_input.json /workspace/worker/src/test_input.json
+
+RUN chmod +x /workspace/worker/start.sh # Make start.sh executable
 
 # Copy workflows
 COPY workflows/ /workspace/worker/workflows/
 
-# Copy scripts (e.g., for model downloading)
-COPY scripts/ /workspace/worker/scripts/
-
-# Copy ComfyUI and its installed dependencies and custom nodes from the installer stage
-COPY --from=installer /comfyui /comfyui
+# Copy helper scripts
+COPY scripts/comfy-node-install.sh /usr/local/bin/comfy-node-install
+COPY scripts/comfy-manager-set-mode.sh /usr/local/bin/comfy-manager-set-mode
+RUN chmod +x /usr/local/bin/comfy-node-install /usr/local/bin/comfy-manager-set-mode
 
 # Set environment variables for ComfyUI access (if needed by handler.py)
 ENV COMFYUI_HOST=127.0.0.1
@@ -90,6 +160,6 @@ ENV COMFYUI_PORT=8080
 # Expose the ComfyUI port (if you want to access it directly, typically not for worker)
 EXPOSE 8080
 
-# Set the entrypoint for the worker
-# This will execute the handler.py script when the container starts
-ENTRYPOINT ["python3", "-u", "/workspace/worker/src/handler.py"]
+# Set the default command to run when starting the container
+# This will execute the start.sh script, which then should launch ComfyUI and handler.py
+CMD ["/workspace/worker/start.sh"]
