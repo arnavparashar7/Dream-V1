@@ -14,6 +14,7 @@ ENV CMAKE_BUILD_PARALLEL_LEVEL=8
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3.12 \
     python3.12-venv \
+    python3-pip \ # <--- ADDED THIS LINE: Ensures pip3 is installed
     git \
     wget \
     curl \
@@ -26,10 +27,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     && rm -rf /var/lib/apt/lists/* \
     && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1 \
-    && update-alternatives --install /usr/bin/pip3 pip3 /usr/bin/pip3 1 \
+    # REMOVED: The problematic update-alternatives for pip3, as python3-pip should set it up correctly
     && ln -sf /usr/bin/python3 /usr/bin/python \
     && ln -sf /usr/bin/pip3 /usr/bin/pip
-
 # --- Installer Stage: Installs ComfyUI, uv, virtual environment, and all Python dependencies ---
 FROM base AS installer
 
