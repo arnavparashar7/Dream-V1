@@ -73,7 +73,7 @@ RUN uv pip install --system \
     --index-url https://download.pytorch.org/whl/cu121 \
     --extra-index-url https://pypi.org/simple/
 
-RUN uv pip install --system 'runpod>=1.7.12'
+RUN /opt/venv/bin/pip install --upgrade 'runpod>=1.7.12'
 
 # --- Custom Nodes Installation ---
 # Install custom nodes and their requirements directly into the ComfyUI installation.
