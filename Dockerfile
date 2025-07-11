@@ -1,5 +1,5 @@
 # Stage 0: Base image with common system dependencies and global Python setup
-FROM nvcr.io/nvidia/cuda:12.1.1-devel-ubuntu22.04 AS base
+FROM ghcr.io/runpod-workers/worker-comfyui:cuda-12.1 AS base
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PIP_PREFER_BINARY=1
