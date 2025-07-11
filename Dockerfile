@@ -1,45 +1,7 @@
-# Stage 1: Base image with common system dependencies and global Python setup
-FROM nvidia/cuda:12.6.3-cudnn-runtime-ubuntu24.04 AS base
-
-# Prevents prompts from packages asking for user input during installation
-ENV DEBIAN_FRONTEND=noninteractive
-# Prefer binary wheels over source distributions for faster pip installations
-ENV PIP_PREFER_BINARY=1
-# Ensures output from python is printed immediately to the terminal without buffering
-ENV PYTHONUNBUFFERED=1
-# Speed up some cmake builds
-ENV CMAKE_BUILD_PARALLEL_LEVEL=8
-
-# Install Python, and core system tools excluding git for now (it will be installed separately)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3.12 \
-    python3.12-venv \
-    python3-pip \
-    wget \
-    curl \
-    unzip \
-    libgl1 \
-    libglib2.0-0 \
-    libsm6 \
-    libxext6 \
-    libxrender1 \
-    ffmpeg \
-    && rm -rf /var/lib/apt/lists/* \
-    && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1 \
-    && ln -sf /usr/bin/python3 /usr/bin/python \
-    && ln -sf /usr/bin/pip3 /usr/bin/pip
-
-# --- NEW: Install git in a separate RUN command to ensure it's installed ---
-RUN apt-get update && apt-get install -y --no-install-recommends git
-
-# --- NEW: Verification step to confirm git is installed and in PATH ---
-RUN git --version
-
-# --- Installer Stage: Installs ComfyUI, uv, virtual environment, and all Python dependencies ---
+# Stage 1: Installer - Set up ComfyUI and install all dependencies
 FROM base AS installer
 
 # Install uv (latest) using official installer and create isolated venv
-# uv is installed globally first, then used to create and populate the venv
 RUN wget -qO- https://astral.sh/uv/install.sh | sh \
     && ln -s /root/.local/bin/uv /usr/local/bin/uv \
     && ln -s /root/.local/bin/uvx /usr/local/bin/uvx \
@@ -48,24 +10,38 @@ RUN wget -qO- https://astral.sh/uv/install.sh | sh \
 # Use the virtual environment for all subsequent commands in this stage
 ENV PATH="/opt/venv/bin:${PATH}"
 
-# Install comfy-cli + dependencies needed by it to install ComfyUI into the venv
-RUN uv pip install comfy-cli pip setuptools wheel
-
-# Change working directory for ComfyUI installation
+# --- NEW: Clone ComfyUI directly and install its requirements ---
 WORKDIR /comfyui
+RUN git clone https://github.com/comfyanonymous/ComfyUI.git .
 
-# Install ComfyUI into this workspace using comfy-cli
-# The `--workspace /comfyui` makes comfy-cli install ComfyUI here.
-# The `uv venv /opt/venv` and `ENV PATH` ensure comfy-cli operates within the venv.
-RUN /usr/bin/yes | comfy --workspace /comfyui install --version 0.3.43 --cuda-version 12.6 --nvidia
+# Install ComfyUI's core requirements
+# This is crucial for ComfyUI to run.
+RUN uv pip install --system -r requirements.txt
+
+# --- END NEW ---
+
+# Install comfy-cli + dependencies needed by it (if still desired, though direct clone is often enough)
+# If you still want comfy-cli for other reasons, keep this. Otherwise, it can be removed.
+# RUN uv pip install comfy-cli pip setuptools wheel
+
+# --- REMOVED: The problematic comfy install command ---
+# RUN /usr/bin/yes | comfy --workspace /comfyui install --version 0.3.43 --cuda-version 12.6 --nvidia
 
 # Support for the network volume - ensure this path is correct relative to the build context
-# Assuming src/extra_model_paths.yaml is in the build context root's src/ directory
 ADD src/extra_model_paths.yaml ./
 
+# Copy the custom requirements.txt from the build context (repo root)
+# to a known, distinct location inside the image (e.g., /tmp/user_requirements.txt)
+COPY requirements.txt /tmp/user_requirements.txt
+
 # Install Python runtime dependencies for the handler into the venv
-# These are the user's custom requirements that handler.py explicitly uses
-RUN uv pip install runpod requests websocket-client
+# This includes 'runpod', 'requests', 'websocket-client'
+# This RUN command now also handles xformers and PyTorch-related dependencies
+RUN uv pip install --system \
+    -r /tmp/user_requirements.txt \    `# Your custom requirements.txt (copied from repo root)`
+    xformers==0.0.22.post7 \           `# Explicit xformers version`
+    --index-url https://download.pytorch.org/whl/cu121 \
+    --extra-index-url https://pypi.org/simple/
 
 # --- Custom Nodes Installation ---
 # Install custom nodes and their requirements directly into the ComfyUI installation.
