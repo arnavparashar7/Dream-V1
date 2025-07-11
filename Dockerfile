@@ -15,7 +15,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3.12 \
     python3.12-venv \
     python3-pip \
-    git \                 # <--- ENSURE THE LINE ABOVE THIS ENDS WITH A PERFECT '\'
+    git \ 
     wget \
     curl \
     unzip \
