@@ -10,13 +10,11 @@ ENV PYTHONUNBUFFERED=1
 # Speed up some cmake builds
 ENV CMAKE_BUILD_PARALLEL_LEVEL=8
 
-# Install Python, git and other necessary tools
-# Install Python, git and other necessary tools
+# Install Python, and core system tools excluding git for now (it will be installed separately)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3.12 \
     python3.12-venv \
     python3-pip \
-    git \
     wget \
     curl \
     unzip \
@@ -30,6 +28,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1 \
     && ln -sf /usr/bin/python3 /usr/bin/python \
     && ln -sf /usr/bin/pip3 /usr/bin/pip
+
+# --- NEW: Install git in a separate RUN command to ensure it's installed ---
+RUN apt-get update && apt-get install -y --no-install-recommends git
+
+# --- NEW: Verification step to confirm git is installed and in PATH ---
+RUN git --version
+
 # --- Installer Stage: Installs ComfyUI, uv, virtual environment, and all Python dependencies ---
 FROM base AS installer
 
@@ -134,11 +139,6 @@ WORKDIR /workspace/worker
 RUN mkdir -p /workspace/worker/src
 
 # Add application code and scripts
-# Assuming handler.py is in src/, and start.sh is in src/
-# COPY src/start.sh /workspace/worker/start.sh
-# COPY src/handler.py /workspace/worker/src/handler.py
-# COPY src/test_input.json /workspace/worker/src/test_input.json # if needed
-# Use ADD for convenience if start.sh/test_input.json are directly in src/
 ADD src/start.sh /workspace/worker/start.sh
 ADD src/handler.py /workspace/worker/src/handler.py
 
