@@ -1,5 +1,5 @@
 # Use RunPod's PyTorch image with CUDA 12.8.1 and Python 3.11
-FROM runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04
+FROM runpod/pytorch:2.8.0-py3.11-cuda12.1-cudnn-devel-ubuntu22.04
 
 LABEL maintainer="you"
 LABEL description="Serverless ComfyUI worker with Flux/Kontext workflows and RunPod handler."
