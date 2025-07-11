@@ -12,9 +12,9 @@ echo "worker-comfyui: Starting ComfyUI"
 : "${COMFY_LOG_LEVEL:=DEBUG}"
 
 if [ "$SERVE_API_LOCALLY" == "true" ]; then
-    python -u /comfyui/main.py --disable-auto-launch --disable-metadata --listen --verbose "${COMFY_LOG_LEVEL}" --log-stdout &
+    /opt/venv/bin/python -u /comfyui/main.py --disable-auto-launch --disable-metadata --listen --verbose "${COMFY_LOG_LEVEL}" --log-stdout &
 else
-    python -u /comfyui/main.py --disable-auto-launch --disable-metadata --verbose "${COMFY_LOG_LEVEL}" --log-stdout &
+    /opt/venv/bin/python -u /comfyui/main.py --disable-auto-launch --disable-metadata --verbose "${COMFY_LOG_LEVEL}" --log-stdout &
 fi
 
 # Wait for ComfyUI to actually start
@@ -26,5 +26,5 @@ cd /workspace/worker/src
 if [ "$SERVE_API_LOCALLY" == "true" ]; then
     python -u handler.py --rp_serve_api --rp_api_host=0.0.0.0
 else
-    python -u handler.py
+    /opt/venv/bin/python -u handler.py
 fi
