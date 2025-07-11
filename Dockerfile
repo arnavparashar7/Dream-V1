@@ -141,7 +141,6 @@ RUN mkdir -p /workspace/worker/src
 # Use ADD for convenience if start.sh/test_input.json are directly in src/
 ADD src/start.sh /workspace/worker/start.sh
 ADD src/handler.py /workspace/worker/src/handler.py
-ADD src/test_input.json /workspace/worker/src/test_input.json
 
 RUN chmod +x /workspace/worker/start.sh # Make start.sh executable
 
