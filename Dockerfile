@@ -10,25 +10,12 @@ RUN wget -qO- https://astral.sh/uv/install.sh | sh \
 # Use the virtual environment for all subsequent commands in this stage
 ENV PATH="/opt/venv/bin:${PATH}"
 
-# --- NEW: Clone ComfyUI directly and install its requirements ---
+# Clone ComfyUI directly and install its requirements
 WORKDIR /comfyui
 RUN git clone https://github.com/comfyanonymous/ComfyUI.git .
 
 # Install ComfyUI's core requirements
-# This is crucial for ComfyUI to run.
 RUN uv pip install --system -r requirements.txt
-
-# --- END NEW ---
-
-# Install comfy-cli + dependencies needed by it (if still desired, though direct clone is often enough)
-# If you still want comfy-cli for other reasons, keep this. Otherwise, it can be removed.
-# RUN uv pip install comfy-cli pip setuptools wheel
-
-# --- REMOVED: The problematic comfy install command ---
-# RUN /usr/bin/yes | comfy --workspace /comfyui install --version 0.3.43 --cuda-version 12.6 --nvidia
-
-# Support for the network volume - ensure this path is correct relative to the build context
-ADD src/extra_model_paths.yaml ./
 
 # Copy the custom requirements.txt from the build context (repo root)
 # to a known, distinct location inside the image (e.g., /tmp/user_requirements.txt)
@@ -36,10 +23,10 @@ COPY requirements.txt /tmp/user_requirements.txt
 
 # Install Python runtime dependencies for the handler into the venv
 # This includes 'runpod', 'requests', 'websocket-client'
-# This RUN command now also handles xformers and PyTorch-related dependencies
+# This RUN command also handles xformers and PyTorch-related dependencies
 RUN uv pip install --system \
-    -r /tmp/user_requirements.txt \    `# Your custom requirements.txt (copied from repo root)`
-    xformers==0.0.22.post7 \           `# Explicit xformers version`
+    -r /tmp/user_requirements.txt \
+    xformers==0.0.22.post7 \
     --index-url https://download.pytorch.org/whl/cu121 \
     --extra-index-url https://pypi.org/simple/
 
