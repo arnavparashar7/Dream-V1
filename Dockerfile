@@ -5,12 +5,24 @@ FROM runpod/worker-comfyui:5.1.0-base
 ENV COMFYUI_HOST=127.0.0.1
 ENV COMFYUI_PORT=8080
 
-# --- Install Custom Nodes using comfy-cli ---
-# The comfy-node-install command directly installs nodes from their GitHub repos.
-# These will be installed into /comfyui/custom_nodes/
-RUN comfy-node-install XLabs-AI/x-flux-comfyui kijai/ComfyUI-KJNodes
+# --- Install Custom Nodes (direct git clone) ---
+# Change working directory to /comfyui where custom_nodes typically reside
+WORKDIR /comfyui
+
+# XLabs-AI/x-flux-comfyui
+RUN git clone --depth 1 https://github.com/XLabs-AI/x-flux-comfyui.git custom_nodes/XLabs-AI && \
+    if [ -f custom_nodes/XLabs-AI/requirements.txt ]; then \
+        pip install -r custom_nodes/XLabs-AI/requirements.txt; \
+    fi
+
+# For ColorMatch (from comfyui-kjnodes)
+RUN git clone --depth 1 https://github.com/kijai/ComfyUI-KJNodes.git custom_nodes/comfyui-kjnodes && \
+    if [ -f custom_nodes/comfyui-kjnodes/requirements.txt ]; then \
+        pip install -r custom_nodes/comfyui-kjnodes/requirements.txt; \
+    fi
 
 # --- Download Models using comfy-cli ---
+# Ensure WORKDIR is still /comfyui for relative paths
 # The `--filename` is what you use in your ComfyUI workflow.
 # Models will be downloaded to /comfyui/<relative-path>/<filename>
 
@@ -31,12 +43,12 @@ RUN comfy model download --url https://huggingface.co/XLabs-AI/flux-controlnet-d
 # The base image already has runpod, PyTorch, xformers, etc.
 # We'll install `websocket-client`, `requests`, and `opencv-python` specifically,
 # as they were in your `requirements.txt` and might not be in the base image.
-# We'll also re-install runpod to ensure you have the correct version.
 COPY requirements.txt /tmp/user_requirements.txt
 RUN pip install -r /tmp/user_requirements.txt
 
 # --- Setup worker application files ---
 # Set the working directory for your application code
+# This will be /workspace/worker, where your handler and workflows are.
 WORKDIR /workspace/worker
 
 # Create the src directory
