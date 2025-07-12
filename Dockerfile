@@ -7,15 +7,15 @@ WORKDIR /comfyui
 
 # XLabs-AI/x-flux-comfyui
 RUN git clone --depth 1 https://github.com/XLabs-AI/x-flux-comfyui.git custom_nodes/XLabs-AI && \
-    if [ -f custom_nodes/XLabs-AI/requirements.txt ]; then \
-        pip install -r custom_nodes/XLabs-AI/requirements.txt; \
-    fi
+    if [ -f custom_nodes/XLabs-AI/requirements.txt ]; then \
+        pip install -r custom_nodes/XLabs-AI/requirements.txt; \
+    fi
 
 # For ColorMatch (from comfyui-kjnodes)
 RUN git clone --depth 1 https://github.com/kijai/ComfyUI-KJNodes.git custom_nodes/comfyui-kjnodes && \
-    if [ -f custom_nodes/comfyui-kjnodes/requirements.txt ]; then \
-        pip install -r custom_nodes/comfyui-kjnodes/requirements.txt; \
-    fi
+    if [ -f custom_nodes/comfyui-kjnodes/requirements.txt ]; then \
+        pip install -r custom_nodes/comfyui-kjnodes/requirements.txt; \
+    fi
 
 # --- Download Models using comfy-cli ---
 # Ensure WORKDIR is still /comfyui for relative paths
@@ -26,8 +26,11 @@ RUN git clone --depth 1 https://github.com/kijai/ComfyUI-KJNodes.git custom_node
 RUN comfy model download --url https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/clip_l.safetensors --relative-path models/text_encoders --filename clip_l.safetensors
 RUN comfy model download --url https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/t5xxl_fp8_e4m3fn_scaled.safetensors --relative-path models/text_encoders --filename t5xxl_fp8_e4m3fn_scaled.safetensors
 
-# UNET/Diffusion Model
+# UNET/Diffusion Model (flux1-dev-kontext_fp8_scaled.safetensors)
 RUN comfy model download --url https://huggingface.co/Comfy-Org/flux1-kontext-dev_ComfyUI/resolve/main/split_files/diffusion_models/flux1-dev-kontext_fp8_scaled.safetensors --relative-path models/checkpoints --filename flux1-dev-kontext_fp8_scaled.safetensors
+
+# --- ADDED: Download flux1-dev-fp8.safetensors ---
+RUN comfy model download --url https://huggingface.co/Kijai/flux-fp8/resolve/main/flux1-dev-fp8.safetensors --relative-path models/checkpoints --filename flux1-dev-fp8.safetensors
 
 # VAE
 RUN comfy model download --url https://huggingface.co/Comfy-Org/Lumina_Image_2.0_Repackaged/resolve/main/split_files/vae/ae.safetensors --relative-path models/vae --filename ae.safetensors
