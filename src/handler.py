@@ -1,5 +1,5 @@
 import runpod
-from runpod.serverless.utils import rp_download, rp_cleanup
+from runpod.serverless.utils import rp_upload
 import json
 import urllib.request
 import urllib.parse
@@ -13,341 +13,749 @@ import uuid
 import tempfile
 import socket
 import traceback
-import requests
-import pathlib
 
-# Cloudflare Images Configuration (Environment Variables)
-CF_IMAGES_ACCOUNT_ID = os.environ.get("CF_IMAGES_ACCOUNT_ID")
-CF_IMAGES_API_TOKEN = os.environ.get("CF_IMAGES_API_TOKEN")
+# Time to wait between API check attempts in milliseconds
+COMFY_API_AVAILABLE_INTERVAL_MS = 50
+# Maximum number of API check attempts
+COMFY_API_AVAILABLE_MAX_RETRIES = 500
+# Websocket reconnection behaviour (can be overridden through environment variables)
+# NOTE: more attempts and diagnostics improve debuggability whenever ComfyUI crashes mid-job.
+#   • WEBSOCKET_RECONNECT_ATTEMPTS sets how many times we will try to reconnect.
+#   • WEBSOCKET_RECONNECT_DELAY_S sets the sleep in seconds between attempts.
+#
+# If the respective env-vars are not supplied we fall back to sensible defaults ("5" and "3").
+WEBSOCKET_RECONNECT_ATTEMPTS = int(os.environ.get("WEBSOCKET_RECONNECT_ATTEMPTS", 5))
+WEBSOCKET_RECONNECT_DELAY_S = int(os.environ.get("WEBSOCKET_RECONNECT_DELAY_S", 3))
 
-# Global variables for ComfyUI API
-COMFYUI_HOST = os.environ.get("COMFYUI_HOST", "127.0.0.1")
-COMFYUI_PORT = os.environ.get("COMFYUI_PORT", "8080")
-COMFYUI_URL = f"http://{COMFYUI_HOST}:{COMFYUI_PORT}"
-WS_URL = f"ws://{COMFYUI_HOST}:{COMFYUI_PORT}/ws?clientId="
+# Extra verbose websocket trace logs (set WEBSOCKET_TRACE=true to enable)
+if os.environ.get("WEBSOCKET_TRACE", "false").lower() == "true":
+    # This prints low-level frame information to stdout which is invaluable for diagnosing
+    # protocol errors but can be noisy in production – therefore gated behind an env-var.
+    websocket.enableTrace(True)
 
-def upload_to_cloudflare_images(file_path: str) -> str:
-    """
-    Uploads a local file to Cloudflare Images.
-    Returns the public URL of the uploaded image.
-    """
-    if not CF_IMAGES_ACCOUNT_ID or not CF_IMAGES_API_TOKEN:
-        print("Cloudflare Images credentials missing. Cannot upload image.")
-        return None # Indicate failure to upload
+# Host where ComfyUI is running
+COMFY_HOST = "127.0.0.1:8188"
+# Enforce a clean state after each job is done
+# see https://docs.runpod.io/docs/handler-additional-controls#refresh-worker
+REFRESH_WORKER = os.environ.get("REFRESH_WORKER", "false").lower() == "true"
 
-    url = f"https://api.cloudflare.com/client/v4/accounts/{CF_IMAGES_ACCOUNT_ID}/images/v1"
-    headers = {"Authorization": f"Bearer {CF_IMAGES_API_TOKEN}"}
+# ---------------------------------------------------------------------------
+# Helper: quick reachability probe of ComfyUI HTTP endpoint (port 8188)
+# ---------------------------------------------------------------------------
 
-    with pathlib.Path(file_path).open("rb") as img:
-        files = {"file": img}
-        data  = {
-            "requireSignedURLs": "false",     # Set to "true" if you want signed URLs
-            "metadata": json.dumps({"src": os.path.basename(file_path)})
+
+def _comfy_server_status():
+    """Return a dictionary with basic reachability info for the ComfyUI HTTP server."""
+    try:
+        resp = requests.get(f"http://{COMFY_HOST}/", timeout=5)
+        return {
+            "reachable": resp.status_code == 200,
+            "status_code": resp.status_code,
         }
+    except Exception as exc:
+        return {"reachable": False, "error": str(exc)}
+
+
+def _attempt_websocket_reconnect(ws_url, max_attempts, delay_s, initial_error):
+    """
+    Attempts to reconnect to the WebSocket server after a disconnect.
+
+    Args:
+        ws_url (str): The WebSocket URL (including client_id).
+        max_attempts (int): Maximum number of reconnection attempts.
+        delay_s (int): Delay in seconds between attempts.
+        initial_error (Exception): The error that triggered the reconnect attempt.
+
+    Returns:
+        websocket.WebSocket: The newly connected WebSocket object.
+
+    Raises:
+        websocket.WebSocketConnectionClosedException: If reconnection fails after all attempts.
+    """
+    print(
+        f"worker-comfyui - Websocket connection closed unexpectedly: {initial_error}. Attempting to reconnect..."
+    )
+    last_reconnect_error = initial_error
+    for attempt in range(max_attempts):
+        # Log current server status before each reconnect attempt so that we can
+        # see whether ComfyUI is still alive (HTTP port 8188 responding) even if
+        # the websocket dropped. This is extremely useful to differentiate
+        # between a network glitch and an outright ComfyUI crash/OOM-kill.
+        srv_status = _comfy_server_status()
+        if not srv_status["reachable"]:
+            # If ComfyUI itself is down there is no point in retrying the websocket –
+            # bail out immediately so the caller gets a clear "ComfyUI crashed" error.
+            print(
+                f"worker-comfyui - ComfyUI HTTP unreachable – aborting websocket reconnect: {srv_status.get('error', 'status '+str(srv_status.get('status_code')))}"
+            )
+            raise websocket.WebSocketConnectionClosedException(
+                "ComfyUI HTTP unreachable during websocket reconnect"
+            )
+
+        # Otherwise we proceed with reconnect attempts while server is up
+        print(
+            f"worker-comfyui - Reconnect attempt {attempt + 1}/{max_attempts}... (ComfyUI HTTP reachable, status {srv_status.get('status_code')})"
+        )
         try:
-            r = requests.post(url, headers=headers, files=files, data=data)
-            r.raise_for_status() # Raise an exception for HTTP errors
-            response_data = r.json()
-            if response_data and response_data.get("success"):
-                image_id = response_data["result"]["id"]
-                image_url = response_data["result"]["variants"][0] # Get the public URL
-                print(f"Uploaded {os.path.basename(file_path)} to Cloudflare Images. ID: {image_id}, URL: {image_url}")
-                return image_url
+            # Need to create a new socket object for reconnect
+            new_ws = websocket.WebSocket()
+            new_ws.connect(ws_url, timeout=10)  # Use existing ws_url
+            print(f"worker-comfyui - Websocket reconnected successfully.")
+            return new_ws  # Return the new connected socket
+        except (
+            websocket.WebSocketException,
+            ConnectionRefusedError,
+            socket.timeout,
+            OSError,
+        ) as reconn_err:
+            last_reconnect_error = reconn_err
+            print(
+                f"worker-comfyui - Reconnect attempt {attempt + 1} failed: {reconn_err}"
+            )
+            if attempt < max_attempts - 1:
+                print(
+                    f"worker-comfyui - Waiting {delay_s} seconds before next attempt..."
+                )
+                time.sleep(delay_s)
             else:
-                print(f"Cloudflare Images upload failed: {response_data.get('errors', 'Unknown error')}")
-                return None
-        except requests.exceptions.RequestException as e:
-            print(f"Error uploading to Cloudflare Images: {e}")
-            return None
+                print(f"worker-comfyui - Max reconnection attempts reached.")
+
+    # If loop completes without returning, raise an exception
+    print("worker-comfyui - Failed to reconnect websocket after connection closed.")
+    raise websocket.WebSocketConnectionClosedException(
+        f"Connection closed and failed to reconnect. Last error: {last_reconnect_error}"
+    )
+
+
+def validate_input(job_input):
+    """
+    Validates the input for the handler function.
+
+    Args:
+        job_input (dict): The input data to validate.
+
+    Returns:
+        tuple: A tuple containing the validated data and an error message, if any.
+               The structure is (validated_data, error_message).
+    """
+    # Validate if job_input is provided
+    if job_input is None:
+        return None, "Please provide input"
+
+    # Check if input is a string and try to parse it as JSON
+    if isinstance(job_input, str):
+        try:
+            job_input = json.loads(job_input)
+        except json.JSONDecodeError:
+            return None, "Invalid JSON format in input"
+
+    # Validate 'workflow' in input
+    workflow = job_input.get("workflow")
+    if workflow is None:
+        return None, "Missing 'workflow' parameter"
+
+    # Validate 'images' in input, if provided
+    images = job_input.get("images")
+    if images is not None:
+        if not isinstance(images, list) or not all(
+            "name" in image and "image" in image for image in images
+        ):
+            return (
+                None,
+                "'images' must be a list of objects with 'name' and 'image' keys",
+            )
+
+    # Return validated data and no error
+    return {"workflow": workflow, "images": images}, None
+
+
+def check_server(url, retries=500, delay=50):
+    """
+    Check if a server is reachable via HTTP GET request
+
+    Args:
+    - url (str): The URL to check
+    - retries (int, optional): The number of times to attempt connecting to the server. Default is 50
+    - delay (int, optional): The time in milliseconds to wait between retries. Default is 500
+
+    Returns:
+    bool: True if the server is reachable within the given number of retries, otherwise False
+    """
+
+    print(f"worker-comfyui - Checking API server at {url}...")
+    for i in range(retries):
+        try:
+            response = requests.get(url, timeout=5)
+
+            # If the response status code is 200, the server is up and running
+            if response.status_code == 200:
+                print(f"worker-comfyui - API is reachable")
+                return True
+        except requests.Timeout:
+            pass
+        except requests.RequestException as e:
+            pass
+
+        # Wait for the specified delay before retrying
+        time.sleep(delay / 1000)
+
+    print(
+        f"worker-comfyui - Failed to connect to server at {url} after {retries} attempts."
+    )
+    return False
+
+
+def upload_images(images):
+    """
+    Upload a list of base64 encoded images to the ComfyUI server using the /upload/image endpoint.
+
+    Args:
+        images (list): A list of dictionaries, each containing the 'name' of the image and the 'image' as a base64 encoded string.
+
+    Returns:
+        dict: A dictionary indicating success or error.
+    """
+    if not images:
+        return {"status": "success", "message": "No images to upload", "details": []}
+
+    responses = []
+    upload_errors = []
+
+    print(f"worker-comfyui - Uploading {len(images)} image(s)...")
+
+    for image in images:
+        try:
+            name = image["name"]
+            image_data_uri = image["image"]  # Get the full string (might have prefix)
+
+            # --- Strip Data URI prefix if present ---
+            if "," in image_data_uri:
+                # Find the comma and take everything after it
+                base64_data = image_data_uri.split(",", 1)[1]
+            else:
+                # Assume it's already pure base64
+                base64_data = image_data_uri
+            # --- End strip ---
+
+            blob = base64.b64decode(base64_data)  # Decode the cleaned data
+
+            # Prepare the form data
+            files = {
+                "image": (name, BytesIO(blob), "image/png"),
+                "overwrite": (None, "true"),
+            }
+
+            # POST request to upload the image
+            response = requests.post(
+                f"http://{COMFY_HOST}/upload/image", files=files, timeout=30
+            )
+            response.raise_for_status()
+
+            responses.append(f"Successfully uploaded {name}")
+            print(f"worker-comfyui - Successfully uploaded {name}")
+
+        except base64.binascii.Error as e:
+            error_msg = f"Error decoding base64 for {image.get('name', 'unknown')}: {e}"
+            print(f"worker-comfyui - {error_msg}")
+            upload_errors.append(error_msg)
+        except requests.Timeout:
+            error_msg = f"Timeout uploading {image.get('name', 'unknown')}"
+            print(f"worker-comfyui - {error_msg}")
+            upload_errors.append(error_msg)
+        except requests.RequestException as e:
+            error_msg = f"Error uploading {image.get('name', 'unknown')}: {e}"
+            print(f"worker-comfyui - {error_msg}")
+            upload_errors.append(error_msg)
         except Exception as e:
-            print(f"An unexpected error occurred during Cloudflare Images upload: {e}")
-            return None
+            error_msg = (
+                f"Unexpected error uploading {image.get('name', 'unknown')}: {e}"
+            )
+            print(f"worker-comfyui - {error_msg}")
+            upload_errors.append(error_msg)
 
-def connect_to_comfyui(client_id):
-    """Establishes a WebSocket connection to ComfyUI."""
+    if upload_errors:
+        print(f"worker-comfyui - image(s) upload finished with errors")
+        return {
+            "status": "error",
+            "message": "Some images failed to upload",
+            "details": upload_errors,
+        }
+
+    print(f"worker-comfyui - image(s) upload complete")
+    return {
+        "status": "success",
+        "message": "All images uploaded successfully",
+        "details": responses,
+    }
+
+
+def get_available_models():
+    """
+    Get list of available models from ComfyUI
+
+    Returns:
+        dict: Dictionary containing available models by type
+    """
     try:
-        ws = websocket.WebSocket()
-        ws.connect(WS_URL + client_id)
-        return ws
-    except Exception as e:
-        print(f"Failed to connect to ComfyUI WebSocket: {e}")
-        raise
+        response = requests.get(f"http://{COMFY_HOST}/object_info", timeout=10)
+        response.raise_for_status()
+        object_info = response.json()
 
-def queue_prompt(prompt, client_id, ws):
-    """Queues a prompt with ComfyUI."""
-    p = {"prompt": prompt, "client_id": client_id}
-    data = json.dumps(p).encode('utf-8')
-    try:
-        response = urllib.request.urlopen(urllib.request.Request(f"{COMFYUI_URL}/prompt", data=data))
-        return json.loads(response.read())
-    except urllib.error.URLError as e:
-        print(f"Failed to queue prompt: {e.reason}")
-        raise
-    except Exception as e:
-        print(f"An unexpected error occurred while queuing prompt: {e}")
-        raise
+        # Extract available checkpoints from CheckpointLoaderSimple
+        available_models = {}
+        if "CheckpointLoaderSimple" in object_info:
+            checkpoint_info = object_info["CheckpointLoaderSimple"]
+            if "input" in checkpoint_info and "required" in checkpoint_info["input"]:
+                ckpt_options = checkpoint_info["input"]["required"].get("ckpt_name")
+                if ckpt_options and len(ckpt_options) > 0:
+                    available_models["checkpoints"] = (
+                        ckpt_options[0] if isinstance(ckpt_options[0], list) else []
+                    )
 
-def get_image(filename, subfolder, folder_type):
-    """Retrieves an image from ComfyUI."""
-    data = {"filename": filename, "subfolder": subfolder, "type": folder_type}
-    url_values = urllib.parse.urlencode(data)
-    with urllib.request.urlopen(f"{COMFYUI_URL}/view?{url_values}") as response:
-        return response.read()
+        return available_models
+    except Exception as e:
+        print(f"worker-comfyui - Warning: Could not fetch available models: {e}")
+        return {}
+
+
+def queue_workflow(workflow, client_id):
+    """
+    Queue a workflow to be processed by ComfyUI
+
+    Args:
+        workflow (dict): A dictionary containing the workflow to be processed
+        client_id (str): The client ID for the websocket connection
+
+    Returns:
+        dict: The JSON response from ComfyUI after processing the workflow
+
+    Raises:
+        ValueError: If the workflow validation fails with detailed error information
+    """
+    # Include client_id in the prompt payload
+    payload = {"prompt": workflow, "client_id": client_id}
+    data = json.dumps(payload).encode("utf-8")
+
+    # Use requests for consistency and timeout
+    headers = {"Content-Type": "application/json"}
+    response = requests.post(
+        f"http://{COMFY_HOST}/prompt", data=data, headers=headers, timeout=30
+    )
+
+    # Handle validation errors with detailed information
+    if response.status_code == 400:
+        print(f"worker-comfyui - ComfyUI returned 400. Response body: {response.text}")
+        try:
+            error_data = response.json()
+            print(f"worker-comfyui - Parsed error data: {error_data}")
+
+            # Try to extract meaningful error information
+            error_message = "Workflow validation failed"
+            error_details = []
+
+            # ComfyUI seems to return different error formats, let's handle them all
+            if "error" in error_data:
+                error_info = error_data["error"]
+                if isinstance(error_info, dict):
+                    error_message = error_info.get("message", error_message)
+                    if error_info.get("type") == "prompt_outputs_failed_validation":
+                        error_message = "Workflow validation failed"
+                else:
+                    error_message = str(error_info)
+
+            # Check for node validation errors in the response
+            if "node_errors" in error_data:
+                for node_id, node_error in error_data["node_errors"].items():
+                    if isinstance(node_error, dict):
+                        for error_type, error_msg in node_error.items():
+                            error_details.append(
+                                f"Node {node_id} ({error_type}): {error_msg}"
+                            )
+                    else:
+                        error_details.append(f"Node {node_id}: {node_error}")
+
+            # Check if the error data itself contains validation info
+            if error_data.get("type") == "prompt_outputs_failed_validation":
+                error_message = error_data.get("message", "Workflow validation failed")
+                # For this type of error, we need to parse the validation details from logs
+                # Since ComfyUI doesn't seem to include detailed validation errors in the response
+                # Let's provide a more helpful generic message
+                available_models = get_available_models()
+                if available_models.get("checkpoints"):
+                    error_message += f"\n\nThis usually means a required model or parameter is not available."
+                    error_message += f"\nAvailable checkpoint models: {', '.join(available_models['checkpoints'])}"
+                else:
+                    error_message += "\n\nThis usually means a required model or parameter is not available."
+                    error_message += "\nNo checkpoint models appear to be available. Please check your model installation."
+
+                raise ValueError(error_message)
+
+            # If we have specific validation errors, format them nicely
+            if error_details:
+                detailed_message = f"{error_message}:\n" + "\n".join(
+                    f"• {detail}" for detail in error_details
+                )
+
+                # Try to provide helpful suggestions for common errors
+                if any(
+                    "not in list" in detail and "ckpt_name" in detail
+                    for detail in error_details
+                ):
+                    available_models = get_available_models()
+                    if available_models.get("checkpoints"):
+                        detailed_message += f"\n\nAvailable checkpoint models: {', '.join(available_models['checkpoints'])}"
+                    else:
+                        detailed_message += "\n\nNo checkpoint models appear to be available. Please check your model installation."
+
+                raise ValueError(detailed_message)
+            else:
+                # Fallback to the raw response if we can't parse specific errors
+                raise ValueError(f"{error_message}. Raw response: {response.text}")
+
+        except (json.JSONDecodeError, KeyError) as e:
+            # If we can't parse the error response, fall back to the raw text
+            raise ValueError(
+                f"ComfyUI validation failed (could not parse error response): {response.text}"
+            )
+
+    # For other HTTP errors, raise them normally
+    response.raise_for_status()
+    return response.json()
+
 
 def get_history(prompt_id):
-    """Retrieves prompt history from ComfyUI."""
-    with urllib.request.urlopen(f"{COMFYUI_URL}/history?prompt_id={prompt_id}") as response:
-        return json.loads(response.read())
+    """
+    Retrieve the history of a given prompt using its ID
 
-def interrupt_comfyui():
-    """Interrupts the ComfyUI server."""
+    Args:
+        prompt_id (str): The ID of the prompt whose history is to be retrieved
+
+    Returns:
+        dict: The history of the prompt, containing all the processing steps and results
+    """
+    # Use requests for consistency and timeout
+    response = requests.get(f"http://{COMFY_HOST}/history/{prompt_id}", timeout=30)
+    response.raise_for_status()
+    return response.json()
+
+
+def get_image_data(filename, subfolder, image_type):
+    """
+    Fetch image bytes from the ComfyUI /view endpoint.
+
+    Args:
+        filename (str): The filename of the image.
+        subfolder (str): The subfolder where the image is stored.
+        image_type (str): The type of the image (e.g., 'output').
+
+    Returns:
+        bytes: The raw image data, or None if an error occurs.
+    """
+    print(
+        f"worker-comfyui - Fetching image data: type={image_type}, subfolder={subfolder}, filename={filename}"
+    )
+    data = {"filename": filename, "subfolder": subfolder, "type": image_type}
+    url_values = urllib.parse.urlencode(data)
     try:
-        requests.post(f"{COMFYUI_URL}/interrupt")
-        print("ComfyUI server interrupted.")
+        # Use requests for consistency and timeout
+        response = requests.get(f"http://{COMFY_HOST}/view?{url_values}", timeout=60)
+        response.raise_for_status()
+        print(f"worker-comfyui - Successfully fetched image data for {filename}")
+        return response.content
+    except requests.Timeout:
+        print(f"worker-comfyui - Timeout fetching image data for {filename}")
+        return None
+    except requests.RequestException as e:
+        print(f"worker-comfyui - Error fetching image data for {filename}: {e}")
+        return None
     except Exception as e:
-        print(f"Failed to interrupt ComfyUI server: {e}")
+        print(
+            f"worker-comfyui - Unexpected error fetching image data for {filename}: {e}"
+        )
+        return None
 
-def get_value_at_index(obj, index):
-    """Helper to get a value from a nested list/dict."""
-    for i, (key, value) in enumerate(obj.items()):
-        if i == index:
-            return value
-    return None
-
-def get_nodes_and_workflows_from_input(job_input):
-    """
-    Extracts nodes and workflow_api from the job input.
-    Supports either direct 'workflow_api' or 'workflow_name' with a file lookup.
-    """
-    workflow_api = job_input.get("workflow_api")
-    workflow_name = job_input.get("workflow_name")
-
-    if workflow_api:
-        return workflow_api
-
-    if workflow_name:
-        workflow_path = f"/workspace/worker/workflows/{workflow_name}.json"
-        if not os.path.exists(workflow_path):
-            raise FileNotFoundError(f"Workflow file '{workflow_path}' not found.")
-        with open(workflow_path, 'r') as f:
-            return json.load(f)
-    raise ValueError("Neither 'workflow_api' nor 'workflow_name' provided in job input.")
-
-
-def get_image_output_nodes(workflow):
-    """
-    Identifies and returns a list of node IDs that are 'SaveImage' nodes
-    or other nodes that produce images and whose output is desired.
-    """
-    output_node_ids = []
-    for node_id, node_data in workflow.get("nodes", {}).items():
-        if node_data.get("class_type") == "SaveImage":
-            output_node_ids.append(node_id)
-        # Add other output node types if needed, e.g., ImageSave or custom ones
-        # elif node_data.get("class_type") == "PreviewImage":
-        #    output_node_ids.append(node_id)
-    return output_node_ids
-
-def wait_for_comfyui(timeout=120):
-    """
-    Waits for the ComfyUI server to become available.
-    """
-    start_time = time.time()
-    while time.time() - start_time < timeout:
-        try:
-            response = requests.get(f"{COMFYUI_URL}/queue", timeout=5)
-            if response.status_code == 200:
-                print("ComfyUI server is ready.")
-                return True
-        except requests.exceptions.ConnectionError:
-            pass # Server not yet up
-        except Exception as e:
-            print(f"Error waiting for ComfyUI: {e}")
-        time.sleep(1)
-    print("ComfyUI server did not become ready in time.")
-    return False
 
 def handler(job):
     """
-    Main handler function for RunPod.
+    Handles a job using ComfyUI via websockets for status and image retrieval.
+
+    Args:
+        job (dict): A dictionary containing job details and input parameters.
+
+    Returns:
+        dict: A dictionary containing either an error message or a success status with generated images.
     """
-    print("worker-comfyui - Job received by handler:", job)
+    job_input = job["input"]
+    job_id = job["id"]
 
-    ws = None # Initialize websocket to None
+    # Make sure that the input is valid
+    validated_data, error_message = validate_input(job_input)
+    if error_message:
+        return {"error": error_message}
+
+    # Extract validated data
+    workflow = validated_data["workflow"]
+    input_images = validated_data.get("images")
+
+    # Make sure that the ComfyUI HTTP API is available before proceeding
+    if not check_server(
+        f"http://{COMFY_HOST}/",
+        COMFY_API_AVAILABLE_MAX_RETRIES,
+        COMFY_API_AVAILABLE_INTERVAL_MS,
+    ):
+        return {
+            "error": f"ComfyUI server ({COMFY_HOST}) not reachable after multiple retries."
+        }
+
+    # Upload input images if they exist
+    if input_images:
+        upload_result = upload_images(input_images)
+        if upload_result["status"] == "error":
+            # Return upload errors
+            return {
+                "error": "Failed to upload one or more input images",
+                "details": upload_result["details"],
+            }
+
+    ws = None
+    client_id = str(uuid.uuid4())
+    prompt_id = None
+    output_data = []
+    errors = []
+
     try:
-        job_input = job["input"]
+        # Establish WebSocket connection
+        ws_url = f"ws://{COMFY_HOST}/ws?clientId={client_id}"
+        print(f"worker-comfyui - Connecting to websocket: {ws_url}")
+        ws = websocket.WebSocket()
+        ws.connect(ws_url, timeout=10)
+        print(f"worker-comfyui - Websocket connected")
 
-        # 1. Download input objects
-        # input_urls = job_input.get("input_urls", [])
-        # if input_urls:
-        #     downloaded_input_paths = rp_download.download_input_objects(input_urls)
-        #     print("Downloaded inputs:", downloaded_input_paths)
-        #     # You might need to adjust your workflow to use these downloaded files
-
-        # 2. Get workflow API JSON
-        workflow_api = get_nodes_and_workflows_from_input(job_input)
-
-        # 3. Apply workflow adjustments (placeholders, etc.)
-        # This is where you would iterate through your workflow_api
-        # and replace placeholders like IMAGE_URL, PROMPT_TEXT, SEED, etc.
-        # Example for replacing a placeholder:
-        # For 'Load Image' node, replace URL
-        # For 'CLIPTextEncode' node, replace text
-        # For 'KSampler' node, replace seed, steps, cfg, sampler_name, scheduler
-
-        # Example: Replacing a text prompt in a CLIPTextEncode node (assuming ID 10 is your positive prompt node)
-        positive_prompt_text = job_input.get("positive_prompt", "a professional photo")
-        negative_prompt_text = job_input.get("negative_prompt", "blurry, low quality, bad, ugly")
-        seed = job_input.get("seed", 42)
-        steps = job_input.get("steps", 20)
-        cfg = job_input.get("cfg", 8.0)
-        sampler_name = job_input.get("sampler_name", "euler")
-        scheduler = job_input.get("scheduler", "normal")
-        denoise = job_input.get("denoise", 1.0)
-        image_url = job_input.get("image_url") # For LoadImageFromUrl
-
-        # Dynamically set nodes based on workflow and input.
-        # This part requires knowledge of your specific workflow structure.
-        # Example: Assuming node IDs 6 and 7 are your positive and negative CLIPTextEncode nodes
-        # Adjust these IDs based on your actual workflow JSON
-        if workflow_api.get(str(40)) and workflow_api[str(40)].get("class_type") == "CLIPTextEncodeFlux":
-            # Node 40 is CLIPTextEncodeFlux (Positive)
-            workflow_api[str(40)]["inputs"]["text"] = positive_prompt_text
-            workflow_api[str(40)]["inputs"]["clip"] = get_value_at_index(workflow_api, 38)[0]
-
-        # Node 41 is CLIPTextEncodeFlux (Negative)
-        if workflow_api.get(str(41)) and workflow_api[str(41)].get("class_type") == "CLIPTextEncodeFlux":
-            workflow_api[str(41)]["inputs"]["text"] = negative_prompt_text
-            workflow_api[str(41)]["inputs"]["clip"] = get_value_at_index(workflow_api, 39)[0]
-
-        # KSampler node (e.g., ID 27 in Redesign.json, ID 6 in fill.json)
-        # Find KSampler by class_type as ID can change per workflow
-        for node_id, node_data in workflow_api.get("nodes", {}).items():
-            if node_data.get("class_type") == "KSampler" or node_data.get("class_type") == "KSampler (Efficient)":
-                node_data["inputs"]["seed"] = seed
-                node_data["inputs"]["steps"] = steps
-                node_data["inputs"]["cfg"] = cfg
-                node_data["inputs"]["sampler_name"] = sampler_name
-                node_data["inputs"]["scheduler"] = scheduler
-                node_data["inputs"]["denoise"] = denoise
-                break # Assuming only one KSampler
-
-        # LoadImageFromUrl (e.g., ID 57 in fill.json, if you're using an input image)
-        if image_url:
-            for node_id, node_data in workflow_api.get("nodes", {}).items():
-                if node_data.get("class_type") == "LoadImageFromUrl":
-                    node_data["inputs"]["image"] = image_url
-                    break
-
-        # Convert the modified workflow_api (dict of nodes) back to a list structure if needed by ComfyUI
-        # The RunPod worker expects the job["input"]["workflow_api"] to be the *actual* prompt object.
-        # So, if you load from file, you loaded a dict already structured for ComfyUI.
-        # If your workflow_api is just a dict of nodes, you might need to wrap it in {"prompt": nodes_dict}
-
-        # ComfyUI expects a dictionary with a "prompt" key containing the workflow nodes.
-        # If get_nodes_and_workflows_from_input returns the raw workflow dict, use it directly.
-        # If it returns just the nodes, wrap it.
-        # Assuming workflow_api already correctly contains the "prompt" key or is the prompt itself.
-        prompt = workflow_api # ComfyUI expects this format: {"prompt": {...}}
-
-        if not wait_for_comfyui():
-            raise Exception("ComfyUI server did not become ready.")
-
-        client_id = str(uuid.uuid4())
-        ws = connect_to_comfyui(client_id)
-
-        ws_monitor_thread = None # Placeholder for potential monitoring thread
-
-        # Find all SaveImage nodes (or other desired output nodes)
-        output_node_ids = get_image_output_nodes(workflow_api)
-        if not output_node_ids:
-            print("No 'SaveImage' (or other configured output) nodes found in workflow. "
-                  "No images will be retrieved by the worker unless explicitly handled.")
-
-        # Queue the prompt
-        prompt_info = queue_prompt(prompt, client_id, ws)
-        prompt_id = prompt_info["prompt_id"]
-
-        output_images = []
-        errors = []
-
-        while True:
-            out = ws.recv()
-            if isinstance(out, str):
-                message = json.loads(out)
-                if message["type"] == "progress":
-                    data = message["data"]
-                    # print(f"Progress: {data['value']}/{data['max_value']} (Node: {data['node']})")
-                elif message["type"] == "executing":
-                    data = message["data"]
-                    if data["node"] is None:
-                        break  # Execution is done
+        # Queue the workflow
+        try:
+            queued_workflow = queue_workflow(workflow, client_id)
+            prompt_id = queued_workflow.get("prompt_id")
+            if not prompt_id:
+                raise ValueError(
+                    f"Missing 'prompt_id' in queue response: {queued_workflow}"
+                )
+            print(f"worker-comfyui - Queued workflow with ID: {prompt_id}")
+        except requests.RequestException as e:
+            print(f"worker-comfyui - Error queuing workflow: {e}")
+            raise ValueError(f"Error queuing workflow: {e}")
+        except Exception as e:
+            print(f"worker-comfyui - Unexpected error queuing workflow: {e}")
+            # For ValueError exceptions from queue_workflow, pass through the original message
+            if isinstance(e, ValueError):
+                raise e
             else:
-                continue  # Binary data, likely irrelevant for progress monitoring
+                raise ValueError(f"Unexpected error queuing workflow: {e}")
 
-        # Once execution is done, retrieve images from history
-        history = get_history(prompt_id)[prompt_id]
-
-        for o in history["outputs"]:
-            for node_id in output_node_ids:
-                if node_id in history["outputs"]:
-                    node_output = history["outputs"][node_id]
-                    if "images" in node_output:
-                        for image_data in node_output["images"]:
-                            image = get_image(
-                                image_data["filename"],
-                                image_data["subfolder"],
-                                image_data["type"],
+        # Wait for execution completion via WebSocket
+        print(f"worker-comfyui - Waiting for workflow execution ({prompt_id})...")
+        execution_done = False
+        while True:
+            try:
+                out = ws.recv()
+                if isinstance(out, str):
+                    message = json.loads(out)
+                    if message.get("type") == "status":
+                        status_data = message.get("data", {}).get("status", {})
+                        print(
+                            f"worker-comfyui - Status update: {status_data.get('exec_info', {}).get('queue_remaining', 'N/A')} items remaining in queue"
+                        )
+                    elif message.get("type") == "executing":
+                        data = message.get("data", {})
+                        if (
+                            data.get("node") is None
+                            and data.get("prompt_id") == prompt_id
+                        ):
+                            print(
+                                f"worker-comfyui - Execution finished for prompt {prompt_id}"
                             )
+                            execution_done = True
+                            break
+                    elif message.get("type") == "execution_error":
+                        data = message.get("data", {})
+                        if data.get("prompt_id") == prompt_id:
+                            error_details = f"Node Type: {data.get('node_type')}, Node ID: {data.get('node_id')}, Message: {data.get('exception_message')}"
+                            print(
+                                f"worker-comfyui - Execution error received: {error_details}"
+                            )
+                            errors.append(f"Workflow execution error: {error_details}")
+                            break
+                else:
+                    continue
+            except websocket.WebSocketTimeoutException:
+                print(f"worker-comfyui - Websocket receive timed out. Still waiting...")
+                continue
+            except websocket.WebSocketConnectionClosedException as closed_err:
+                try:
+                    # Attempt to reconnect
+                    ws = _attempt_websocket_reconnect(
+                        ws_url,
+                        WEBSOCKET_RECONNECT_ATTEMPTS,
+                        WEBSOCKET_RECONNECT_DELAY_S,
+                        closed_err,
+                    )
 
-                            # Save to temp file and upload to Cloudflare
-                            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp_file:
-                                tmp_file.write(image)
-                                temp_file_path = tmp_file.name
+                    print(
+                        "worker-comfyui - Resuming message listening after successful reconnect."
+                    )
+                    continue
+                except (
+                    websocket.WebSocketConnectionClosedException
+                ) as reconn_failed_err:
+                    # If _attempt_websocket_reconnect fails, it raises this exception
+                    # Let this exception propagate to the outer handler's except block
+                    raise reconn_failed_err
 
-                            uploaded_url = upload_to_cloudflare_images(temp_file_path)
-                            if uploaded_url:
-                                output_images.append({"image_url": uploaded_url})
-                            else:
-                                print(f"Failed to upload image {image_data['filename']} to Cloudflare.")
+            except json.JSONDecodeError:
+                print(f"worker-comfyui - Received invalid JSON message via websocket.")
 
-                            # Clean up temp file
-                            os.remove(temp_file_path)
+        if not execution_done and not errors:
+            raise ValueError(
+                "Workflow monitoring loop exited without confirmation of completion or error."
+            )
 
-            # Collect workflow errors if any
-            if "errors" in history:
-                errors.extend(history["errors"])
+        # Fetch history even if there were execution errors, some outputs might exist
+        print(f"worker-comfyui - Fetching history for prompt {prompt_id}...")
+        history = get_history(prompt_id)
 
-        # If no images were saved via SaveImage nodes but you expect some,
-        # you might need to manually check for latent/image outputs from other nodes
-        # based on your workflow. This handler specifically looks for SaveImage.
+        if prompt_id not in history:
+            error_msg = f"Prompt ID {prompt_id} not found in history after execution."
+            print(f"worker-comfyui - {error_msg}")
+            if not errors:
+                return {"error": error_msg}
+            else:
+                errors.append(error_msg)
+                return {
+                    "error": "Job processing failed, prompt ID not found in history.",
+                    "details": errors,
+                }
 
-        print("worker-comfyui - Workflow execution finished.")
+        prompt_history = history.get(prompt_id, {})
+        outputs = prompt_history.get("outputs", {})
 
-        final_result = {"images": output_images}
-        if errors:
-            final_result["errors"] = errors
+        if not outputs:
+            warning_msg = f"No outputs found in history for prompt {prompt_id}."
+            print(f"worker-comfyui - {warning_msg}")
+            if not errors:
+                errors.append(warning_msg)
 
-        # 4. Clean up any downloaded inputs
-        rp_cleanup.clean_up_input_objects(downloaded_input_paths if 'downloaded_input_paths' in locals() else [])
+        print(f"worker-comfyui - Processing {len(outputs)} output nodes...")
+        for node_id, node_output in outputs.items():
+            if "images" in node_output:
+                print(
+                    f"worker-comfyui - Node {node_id} contains {len(node_output['images'])} image(s)"
+                )
+                for image_info in node_output["images"]:
+                    filename = image_info.get("filename")
+                    subfolder = image_info.get("subfolder", "")
+                    img_type = image_info.get("type")
 
-        return final_result
+                    # skip temp images
+                    if img_type == "temp":
+                        print(
+                            f"worker-comfyui - Skipping image {filename} because type is 'temp'"
+                        )
+                        continue
 
-    except FileNotFoundError as e:
-        print(f"worker-comfyui - File Error: {e}")
-        return {"error": str(e)}
+                    if not filename:
+                        warn_msg = f"Skipping image in node {node_id} due to missing filename: {image_info}"
+                        print(f"worker-comfyui - {warn_msg}")
+                        errors.append(warn_msg)
+                        continue
+
+                    image_bytes = get_image_data(filename, subfolder, img_type)
+
+                    if image_bytes:
+                        file_extension = os.path.splitext(filename)[1] or ".png"
+
+                        if os.environ.get("BUCKET_ENDPOINT_URL"):
+                            try:
+                                with tempfile.NamedTemporaryFile(
+                                    suffix=file_extension, delete=False
+                                ) as temp_file:
+                                    temp_file.write(image_bytes)
+                                    temp_file_path = temp_file.name
+                                print(
+                                    f"worker-comfyui - Wrote image bytes to temporary file: {temp_file_path}"
+                                )
+
+                                print(f"worker-comfyui - Uploading {filename} to S3...")
+                                s3_url = rp_upload.upload_image(job_id, temp_file_path)
+                                os.remove(temp_file_path)  # Clean up temp file
+                                print(
+                                    f"worker-comfyui - Uploaded {filename} to S3: {s3_url}"
+                                )
+                                # Append dictionary with filename and URL
+                                output_data.append(
+                                    {
+                                        "filename": filename,
+                                        "type": "s3_url",
+                                        "data": s3_url,
+                                    }
+                                )
+                            except Exception as e:
+                                error_msg = f"Error uploading {filename} to S3: {e}"
+                                print(f"worker-comfyui - {error_msg}")
+                                errors.append(error_msg)
+                                if "temp_file_path" in locals() and os.path.exists(
+                                    temp_file_path
+                                ):
+                                    try:
+                                        os.remove(temp_file_path)
+                                    except OSError as rm_err:
+                                        print(
+                                            f"worker-comfyui - Error removing temp file {temp_file_path}: {rm_err}"
+                                        )
+                        else:
+                            # Return as base64 string
+                            try:
+                                base64_image = base64.b64encode(image_bytes).decode(
+                                    "utf-8"
+                                )
+                                # Append dictionary with filename and base64 data
+                                output_data.append(
+                                    {
+                                        "filename": filename,
+                                        "type": "base64",
+                                        "data": base64_image,
+                                    }
+                                )
+                                print(f"worker-comfyui - Encoded {filename} as base64")
+                            except Exception as e:
+                                error_msg = f"Error encoding {filename} to base64: {e}"
+                                print(f"worker-comfyui - {error_msg}")
+                                errors.append(error_msg)
+                    else:
+                        error_msg = f"Failed to fetch image data for {filename} from /view endpoint."
+                        errors.append(error_msg)
+
+            # Check for other output types
+            other_keys = [k for k in node_output.keys() if k != "images"]
+            if other_keys:
+                warn_msg = (
+                    f"Node {node_id} produced unhandled output keys: {other_keys}."
+                )
+                print(f"worker-comfyui - WARNING: {warn_msg}")
+                print(
+                    f"worker-comfyui - --> If this output is useful, please consider opening an issue on GitHub to discuss adding support."
+                )
+
+    except websocket.WebSocketException as e:
+        print(f"worker-comfyui - WebSocket Error: {e}")
+        print(traceback.format_exc())
+        return {"error": f"WebSocket communication error: {e}"}
+    except requests.RequestException as e:
+        print(f"worker-comfyui - HTTP Request Error: {e}")
+        print(traceback.format_exc())
+        return {"error": f"HTTP communication error with ComfyUI: {e}"}
     except ValueError as e:
         print(f"worker-comfyui - Value Error: {e}")
         print(traceback.format_exc())
         return {"error": str(e)}
-    except requests.exceptions.ConnectionError as e:
-        print(f"worker-comfyui - Connection Error: {e}")
-        print(traceback.format_exc())
-        return {"error": f"Could not connect to ComfyUI. Is it running? {e}"}
-    except websocket._exceptions.WebSocketConnectionClosedException as e:
-        print(f"worker-comfyui - WebSocket Connection Closed: {e}")
-        print(traceback.format_exc())
-        return {"error": f"WebSocket connection to ComfyUI closed unexpectedly: {e}"}
     except Exception as e:
         print(f"worker-comfyui - Unexpected Handler Error: {e}")
         print(traceback.format_exc())
@@ -357,5 +765,32 @@ def handler(job):
             print(f"worker-comfyui - Closing websocket connection.")
             ws.close()
 
-    # The original snippet you shared might have ended prematurely, leading to syntax issues.
-    # The `finally` block and subsequent return statements ensure proper closure and response.
+    final_result = {}
+
+    if output_data:
+        final_result["images"] = output_data
+
+    if errors:
+        final_result["errors"] = errors
+        print(f"worker-comfyui - Job completed with errors/warnings: {errors}")
+
+    if not output_data and errors:
+        print(f"worker-comfyui - Job failed with no output images.")
+        return {
+            "error": "Job processing failed",
+            "details": errors,
+        }
+    elif not output_data and not errors:
+        print(
+            f"worker-comfyui - Job completed successfully, but the workflow produced no images."
+        )
+        final_result["status"] = "success_no_images"
+        final_result["images"] = []
+
+    print(f"worker-comfyui - Job completed. Returning {len(output_data)} image(s).")
+    return final_result
+
+
+if __name__ == "__main__":
+    print("worker-comfyui - Starting handler...")
+    runpod.serverless.start({"handler": handler})
