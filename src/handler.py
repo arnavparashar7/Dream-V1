@@ -1,35 +1,33 @@
-import runpod
 import os
 import json
-import requests
-import websocket
 import uuid
 import time
-import urllib.parse
-import traceback
 import pathlib
+import urllib.request
+import urllib.parse
 import tempfile
 import base64
+import requests
+import websocket
+import runpod
+from runpod.serverless.utils import rp_cleanup
 
-# ------------------------------------------------------------------------------
-# ENV VARS
-# ------------------------------------------------------------------------------
-
-COMFY_HOST = os.environ.get("COMFYUI_HOST", "127.0.0.1")
-COMFY_PORT = os.environ.get("COMFYUI_PORT", "8080")
-COMFY_HTTP = f"http://{COMFY_HOST}:{COMFY_PORT}"
-COMFY_WS = f"ws://{COMFY_HOST}:{COMFY_PORT}/ws?clientId="
-
+# ------------------------------------------------------------------
+# ✅ ENVIRONMENT CONFIGURATION
+# ------------------------------------------------------------------
 CF_IMAGES_ACCOUNT_ID = os.environ.get("CF_IMAGES_ACCOUNT_ID")
 CF_IMAGES_API_TOKEN = os.environ.get("CF_IMAGES_API_TOKEN")
+COMFY_HOST = os.environ.get("COMFYUI_HOST", "127.0.0.1")
+COMFY_PORT = os.environ.get("COMFYUI_PORT", "8080")
+COMFY_URL = f"http://{COMFY_HOST}:{COMFY_PORT}"
+WS_URL = f"ws://{COMFY_HOST}:{COMFY_PORT}/ws?clientId="
 
-# ------------------------------------------------------------------------------
-# Cloudflare Images uploader
-# ------------------------------------------------------------------------------
-
-def upload_to_cloudflare_images(file_path: str) -> str:
+# ------------------------------------------------------------------
+# ✅ CLOUDFLARE IMAGE UPLOAD
+# ------------------------------------------------------------------
+def upload_to_cloudflare_images(file_path):
     if not CF_IMAGES_ACCOUNT_ID or not CF_IMAGES_API_TOKEN:
-        print("Cloudflare Images credentials missing. Skipping upload.")
+        print("Cloudflare ENV missing.")
         return None
 
     url = f"https://api.cloudflare.com/client/v4/accounts/{CF_IMAGES_ACCOUNT_ID}/images/v1"
@@ -42,216 +40,130 @@ def upload_to_cloudflare_images(file_path: str) -> str:
             "metadata": json.dumps({"src": os.path.basename(file_path)})
         }
         try:
-            response = requests.post(url, headers=headers, files=files, data=data)
-            response.raise_for_status()
-            resp_data = response.json()
-            if resp_data.get("success"):
-                return resp_data["result"]["variants"][0]
-            else:
-                print(f"Cloudflare upload error: {resp_data.get('errors')}")
-                return None
+            r = requests.post(url, headers=headers, files=files, data=data)
+            r.raise_for_status()
+            resp = r.json()
+            if resp.get("success"):
+                return resp["result"]["variants"][0]
         except Exception as e:
-            print(f"Error uploading to Cloudflare Images: {e}")
-            return None
+            print(f"Cloudflare upload failed: {e}")
+    return None
 
-# ------------------------------------------------------------------------------
-# Helper: pick workflow file
-# ------------------------------------------------------------------------------
-
-def load_workflow_from_file(name):
-    workflow_map = {
-        "fill": "fill.json",
-        "redesign": "Redesign.json"
-    }
-    # default to redesign if invalid
-    selected_file = workflow_map.get(name.lower(), "Redesign.json")
-    path = f"/workspace/worker/workflows/{selected_file}"
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Workflow file not found: {path}")
-    with open(path, 'r') as f:
+# ------------------------------------------------------------------
+# ✅ WORKFLOW HANDLING + NODE INJECTION
+# ------------------------------------------------------------------
+def load_workflow(mode):
+    filename = f"/workspace/worker/workflows/{'Redesign' if mode == 'redesign' else 'fill'}.json"
+    with open(filename, 'r') as f:
         return json.load(f)
 
-# ------------------------------------------------------------------------------
-# Helper: wait for ComfyUI readiness
-# ------------------------------------------------------------------------------
+def inject_inputs(workflow, job_input, mode):
+    prompt = job_input.get("positive_prompt", "a professional photo")
+    image_url = job_input.get("image_url", None)
 
+    if mode == "fill":
+        if "43" in workflow:
+            workflow["43"]["inputs"][0] = prompt
+        if "57" in workflow:
+            workflow["57"]["inputs"][0] = image_url
+    else:
+        if "63" in workflow:
+            workflow["63"]["inputs"][0] = prompt
+        if "15" in workflow:
+            workflow["15"]["inputs"][0] = "remove all the furniture like sofas, tables, plants, lights, fireplace, paintings, curtains and carpet"
+    return workflow
+
+def get_output_node(mode):
+    return "42" if mode == "fill" else "54"
+
+# ------------------------------------------------------------------
+# ✅ COMFYUI CONNECTION HELPERS
+# ------------------------------------------------------------------
 def wait_for_comfyui(timeout=120):
-    print(f"Waiting for ComfyUI at {COMFY_HTTP}...")
     start = time.time()
     while time.time() - start < timeout:
         try:
-            r = requests.get(f"{COMFY_HTTP}/queue", timeout=5)
-            if r.status_code == 200:
-                print("ComfyUI is ready.")
+            if requests.get(f"{COMFY_URL}/queue").status_code == 200:
                 return True
-        except requests.exceptions.ConnectionError:
+        except:
             pass
-        except Exception as e:
-            print(f"Error waiting for ComfyUI: {e}")
         time.sleep(1)
-    print("Timed out waiting for ComfyUI.")
     return False
 
-# ------------------------------------------------------------------------------
-# Helper: connect websocket
-# ------------------------------------------------------------------------------
+def connect_ws(client_id):
+    ws = websocket.WebSocket()
+    ws.connect(WS_URL + client_id)
+    return ws
 
-def connect_to_comfyui_ws(client_id):
-    try:
-        ws = websocket.WebSocket()
-        ws.connect(COMFY_WS + client_id, timeout=10)
-        return ws
-    except Exception as e:
-        print(f"Error connecting WebSocket: {e}")
-        raise
-
-# ------------------------------------------------------------------------------
-# Helpers for talking to ComfyUI
-# ------------------------------------------------------------------------------
-
-def queue_prompt(prompt, client_id):
-    payload = {"prompt": prompt, "client_id": client_id}
-    try:
-        resp = requests.post(f"{COMFY_HTTP}/prompt", json=payload, timeout=30)
-        resp.raise_for_status()
-        return resp.json()
-    except Exception as e:
-        print(f"Error queuing prompt: {e}")
-        raise
+def queue_prompt(workflow, client_id):
+    data = json.dumps({"prompt": workflow, "client_id": client_id}).encode("utf-8")
+    req = urllib.request.Request(f"{COMFY_URL}/prompt", data=data)
+    with urllib.request.urlopen(req) as resp:
+        return json.loads(resp.read())
 
 def get_history(prompt_id):
-    resp = requests.get(f"{COMFY_HTTP}/history/{prompt_id}", timeout=60)
-    resp.raise_for_status()
-    return resp.json()
+    with urllib.request.urlopen(f"{COMFY_URL}/history?prompt_id={prompt_id}") as resp:
+        return json.loads(resp.read())
 
 def get_image(filename, subfolder, folder_type):
-    params = urllib.parse.urlencode({
-        "filename": filename,
-        "subfolder": subfolder,
-        "type": folder_type
-    })
-    resp = requests.get(f"{COMFY_HTTP}/view?{params}", timeout=60)
-    resp.raise_for_status()
-    return resp.content
+    params = urllib.parse.urlencode({"filename": filename, "subfolder": subfolder, "type": folder_type})
+    with urllib.request.urlopen(f"{COMFY_URL}/view?{params}") as resp:
+        return resp.read()
 
-# ------------------------------------------------------------------------------
-# Helper: inject variables into workflow
-# ------------------------------------------------------------------------------
-
-def apply_inputs_to_workflow(workflow, job_input):
-    """
-    You can add more variables here as needed in future.
-    For now we handle positive/negative prompts and image_url
-    """
-    positive = job_input.get("positive_prompt", "A professional photo")
-    negative = job_input.get("negative_prompt", "bad, blurry")
-    image_url = job_input.get("image_url", None)
-
-    for node_id, node in workflow.get("nodes", {}).items():
-        if node.get("class_type") in {"CLIPTextEncodeFlux", "CLIPTextEncode"}:
-            if "positive" in node.get("inputs", {}):
-                node["inputs"]["positive"] = positive
-            if "negative" in node.get("inputs", {}):
-                node["inputs"]["negative"] = negative
-            if "text" in node.get("inputs", {}):
-                # Older format
-                if "positive" in node["inputs"]:
-                    node["inputs"]["text"] = positive
-                else:
-                    node["inputs"]["text"] = negative
-
-        if image_url and node.get("class_type") == "LoadImageFromUrl":
-            node["inputs"]["image"] = image_url
-
-    return workflow
-
-# ------------------------------------------------------------------------------
-# MAIN HANDLER
-# ------------------------------------------------------------------------------
-
+# ------------------------------------------------------------------
+# ✅ MAIN HANDLER
+# ------------------------------------------------------------------
 def handler(job):
-    print("Handler invoked.")
-
     job_input = job.get("input", {})
-    workflow_choice = job_input.get("workflow", "redesign")
+    mode = job_input.get("mode", "fill").lower()
 
     try:
         if not wait_for_comfyui():
-            return {"error": "ComfyUI server is not reachable."}
+            return {"error": "ComfyUI is not reachable."}
 
-        print(f"Loading workflow for choice: {workflow_choice}")
-        workflow_data = load_workflow_from_file(workflow_choice)
-
-        # Inject prompts etc.
-        workflow_data = apply_inputs_to_workflow(workflow_data, job_input)
+        workflow = load_workflow(mode)
+        workflow = inject_inputs(workflow, job_input, mode)
+        output_node_id = get_output_node(mode)
 
         client_id = str(uuid.uuid4())
-        ws = connect_to_comfyui_ws(client_id)
+        ws = connect_ws(client_id)
+        prompt_info = queue_prompt(workflow, client_id)
+        prompt_id = prompt_info["prompt_id"]
 
-        # Queue the prompt
-        prompt_resp = queue_prompt(workflow_data, client_id)
-        prompt_id = prompt_resp.get("prompt_id")
-        if not prompt_id:
-            raise Exception("No prompt_id returned from ComfyUI.")
-
-        # Wait for execution to finish
-        print(f"Prompt queued. ID: {prompt_id}")
         while True:
-            msg = ws.recv()
-            if isinstance(msg, str):
-                message = json.loads(msg)
-                if message.get("type") == "executing":
-                    if message.get("data", {}).get("node") is None:
-                        print("Execution complete.")
-                        break
-            else:
-                continue
+            msg = json.loads(ws.recv())
+            if msg.get("type") == "executing" and msg.get("data", {}).get("node") is None:
+                break
 
-        # Retrieve history
-        history_data = get_history(prompt_id).get(prompt_id, {})
-        outputs = history_data.get("outputs", {})
+        history = get_history(prompt_id).get(prompt_id, {})
+        output_images = []
 
-        image_urls = []
-        for node_output in outputs.values():
-            for image_info in node_output.get("images", []):
-                filename = image_info.get("filename")
-                subfolder = image_info.get("subfolder")
-                img_type = image_info.get("type")
+        if output_node_id in history.get("outputs", {}):
+            node_output = history["outputs"][output_node_id]
+            for img_data in node_output.get("images", []):
+                raw_img = get_image(img_data["filename"], img_data["subfolder"], img_data["type"])
 
-                if not filename or img_type == "temp":
-                    continue
+                with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+                    tmp.write(raw_img)
+                    path = tmp.name
 
-                img_bytes = get_image(filename, subfolder, img_type)
-                if not img_bytes:
-                    continue
-
-                # Save temp
-                with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp_file:
-                    tmp_file.write(img_bytes)
-                    tmp_path = tmp_file.name
-
-                # Upload to Cloudflare
-                uploaded_url = upload_to_cloudflare_images(tmp_path)
-                os.remove(tmp_path)
-
-                if uploaded_url:
-                    image_urls.append(uploaded_url)
+                url = upload_to_cloudflare_images(path)
+                if url:
+                    output_images.append({"image_url": url})
                 else:
-                    # Fallback: Base64 if CF upload fails
-                    b64_image = base64.b64encode(img_bytes).decode("utf-8")
-                    image_urls.append(f"data:image/png;base64,{b64_image}")
+                    b64 = base64.b64encode(raw_img).decode()
+                    output_images.append({"base64": b64})
 
-        return {"images": image_urls}
+                os.remove(path)
+
+        return {"images": output_images}
 
     except Exception as e:
-        print(f"Handler error: {e}")
-        traceback.print_exc()
         return {"error": str(e)}
 
-# ------------------------------------------------------------------------------
-# Entrypoint
-# ------------------------------------------------------------------------------
-
+# ------------------------------------------------------------------
+# ✅ START HANDLER
+# ------------------------------------------------------------------
 if __name__ == "__main__":
-    print("Starting RunPod handler...")
+    print("worker-comfyui - Handler starting...")
     runpod.serverless.start({"handler": handler})
