@@ -17,7 +17,7 @@ import pathlib
 CF_IMAGES_ACCOUNT_ID = os.environ.get("CF_IMAGES_ACCOUNT_ID")
 CF_IMAGES_API_TOKEN = os.environ.get("CF_IMAGES_API_TOKEN")
 COMFY_HOST = os.environ.get("COMFYUI_HOST", "127.0.0.1")
-COMFY_PORT = os.environ.get("COMFYUI_PORT", "8188")
+COMFY_PORT = os.environ.get("COMFYUI_PORT", "8080")
 COMFY_URL = f"http://{COMFY_HOST}:{COMFY_PORT}"
 WS_URL = f"ws://{COMFY_HOST}:{COMFY_PORT}/ws?clientId="
 
