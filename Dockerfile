@@ -1,17 +1,26 @@
 # Start from the RunPod ComfyUI base image
 FROM runpod/worker-comfyui:5.1.0-base
 
-# --- Setup custom node installer ---
-COPY src/comfy-node-install.sh /usr/local/bin/comfy-node-install
-RUN chmod +x /usr/local/bin/comfy-node-install
+# --- Ensure Git is installed (if it's truly missing) ---
+# This line might not be strictly necessary if runpod/worker-comfyui:5.1.0-base
+# already includes git in a discoverable path, but it's a safe explicit step.
+RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
 
-# --- Install Custom Nodes (using the new script) ---
+# --- Install Custom Nodes (direct git clone) ---
+# Change working directory to /comfyui where custom_nodes typically reside
 WORKDIR /comfyui
-# Use the comfy-node-install script to install your custom nodes
-# These names must be recognized by 'comfy node install --mode=remote'
-# Check registry.comfy.org or the official 'comfy node install' documentation
-# If remote mode doesn't work, you might need to revert to git clone for these specific nodes.
-RUN comfy-node-install "XLabs-AI/x-flux-comfyui" "kijai/ComfyUI-KJNodes"
+
+# XLabs-AI/x-flux-comfyui
+RUN git clone --depth 1 https://github.com/XLabs-AI/x-flux-comfyui.git custom_nodes/XLabs-AI && \
+    if [ -f custom_nodes/XLabs-AI/requirements.txt ]; then \
+        pip install -r custom_nodes/XLabs-AI/requirements.txt; \
+    fi
+
+# For ColorMatch (from comfyui-kjnodes)
+RUN git clone --depth 1 https://github.com/kijai/ComfyUI-KJNodes.git custom_nodes/comfyui-kjnodes && \
+    if [ -f custom_nodes/comfyui-kjnodes/requirements.txt ]; then \
+        pip install -r custom_nodes/comfyui-kjnodes/requirements.txt; \
+    fi
 
 # --- Download Models using comfy-cli ---
 # Ensure WORKDIR is still /comfyui for relative paths
